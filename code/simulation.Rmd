@@ -1,0 +1,4263 @@
+---
+title: "simulation_diag_target"
+output: html_document
+date: "2023-10-12"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(MASS)
+library(purrr)
+library(dplyr)
+library(glue)
+library(tidyverse)
+library(nlshrink)
+library(progressr)
+library(stargazer)
+library(plotly)
+library(ggthemes)
+library(EnvStats)
+library(latex2exp)
+library(patchwork)
+library(cowplot)
+library(mvtnorm)
+library(progressr)
+library(parallel)
+library(furrr)
+library(future)
+library("future.callr")
+plan(callr)
+```
+
+```{r general setup}
+p = 100
+n_min = 6
+n_max = 30
+r_min = 0
+r_max = 0.9
+large_min = 1
+large_max = 20
+small = 1
+
+get_err <- function(e, t){
+  err_e = sum((e-t)^2)
+  return(err_e)
+}
+```
+
+```{r diagonal scale difference}
+r = 0.5
+n = 18
+corr = matrix(0, ncol=p, nrow=p)
+for (i in 1:p){
+  for (j in 1:p){
+    corr[i,j]=r^abs(i-j)
+  }
+}
+
+sim_diag <- function(large){
+  
+  sd = diag(c(rep(small,p/2),rep(large,p/2)))
+  cov = sd %*% corr %*% sd
+    
+  sim_err <- function(iter){
+
+    err = data.frame(matrix(nrow=1,ncol=10))
+    colnames(err) = c('OASD','OAS', 'SS', 'RBLW','LW','s','OD','OB','OASB','Oracle')
+    
+    # Generate samples from N(0,cov)
+    sample = mvrnorm(n, rep(0,p), cov)
+    
+    # Estimate the covariance matrix
+    scov = (t(sample) %*% sample)/nrow(sample)
+    f1 = (sum(diag(scov))/p)*diag(p)
+    f2 = diag(diag(scov))
+    tr_s = sum(diag(scov))
+    tr_s2 = sum(diag(t(scov) %*% scov))
+    tr_sdiag2 = sum(diag(diag(diag(scov)) %*% diag(diag(scov))))
+    
+    tr_t = sum(diag(cov))
+    tr_t2 = sum(diag(t(cov) %*% cov))
+    tr_tdiag2 = sum(diag(diag(diag(cov)) %*% diag(diag(cov))))
+    
+    scorr = cov2cor(scov)
+    tr_s_cor = sum(diag(scorr))
+    tr_s2_cor = sum(diag(t(scorr) %*% scorr))
+    f1_cor = (sum(diag(scorr))/p)*diag(p)
+    sample_sc = sample %*% (diag(diag(f2)^(-1/2)))
+    
+    # Method 2&3: LW & RBLW
+    num = 0
+    for (i in 1:n){
+      fill = sum((matrix(sample[i,],ncol=1) %*% matrix(sample[i,],nrow=1) - scov)^2)
+      num = num + fill
+    }
+    den = (n^2)*(tr_s2-(tr_s^2)/p)
+    rou_lw = num/den
+    rou_lw = min(rou_lw,1)
+    scov_lw = (1-rou_lw)*scov+rou_lw*f1
+
+    rou_rblw = (((n-2)/n)*tr_s2+tr_s^2)/((n+2)*(tr_s2-(tr_s^2)/p))
+    rou_rblw = min(rou_rblw,1)
+    scov_rblw = (1-rou_rblw)*scov+rou_rblw*f1
+    
+    # Method 4: oas_c
+    phi = (tr_s2-(tr_s^2)/p)/(tr_s^2+(1-2/p)*tr_s2)
+    rou_oas_constant = min(1/((n+1-2/p)*phi),1)
+    scov_oas_constant = (1-rou_oas_constant)*scov+rou_oas_constant*f1
+
+    # Method 5: oas_v
+    phi1 = (tr_s2-tr_sdiag2)/(tr_s2+tr_s^2-2*tr_sdiag2)
+    rou_oas_variant = min(1/((n+1)*phi1),1)
+    scov_oas_variant = (1-rou_oas_variant)*scov+rou_oas_variant*f2
+    
+    # Method 8: Shafer(applied to correlation matrix)
+    v <- (1/(n*(n - 1))) * (crossprod(sample_sc^2) - (1/n) * (crossprod(sample_sc))^2)
+    diag(v) <- 0
+    d <- (scorr - diag(diag(scorr)))^2
+    rou_ss <- sum(v)/sum(d)
+    rou_ss <- max(min(rou_ss, 1), 0)
+    scorr_ss = (1-rou_ss)*scorr+rou_ss*f1_cor
+    scov_ss = (f2^(1/2)) %*% scorr_ss %*% (f2^(1/2))
+    
+    # Method 9: Oracle_b
+    P = tr_tdiag2
+    R = tr_t2
+    Q = tr_t^2
+    
+    rou_b_o = (Q+R-2*P)/((n+1)*R+Q-(n+2)*P)
+    gamma_b_o = 1-(1/rou_b_o)*(((2/n)*P-(2/(n*p))*R)/(((n+2)/n)*P-(2/(n*p))*R-(1/p)*Q))
+    
+    scov_o_both = (1-rou_b_o)*scov+rou_b_o*(gamma_b_o*f2+(1-gamma_b_o)*f1)
+    
+    # Method 10: oas_b
+    theta = rou_oas_variant
+    A = (tr_s^2)/p
+    B = tr_s2-tr_sdiag2
+    C = tr_sdiag2-A
+    
+    t1 = ((p-1)*C)/((p-1)*(A+C)-B)
+    t2 = (B-(p-1)*C)/((p-1)*(A+C)-B)
+    t3 = (n*p*C)/(2*(p-1)*(A+C)-2*B)
+    
+    if (abs(t3/((t1+t2)*theta+1-t1))<1){
+      gamma_oas = (theta-1)/(theta)
+    }else{
+      gamma_oas = (theta*(t3-t2)-1)/(theta*(t1+t3))
+    }
+    
+    scov_oas_both = (1-theta)*scov+theta*(gamma_oas*f2+(1-gamma_oas)*f1)
+    
+    # Method 11: oracle_v
+    rou_o_variant = ((1/n)*tr_t2-(2/n)*tr_tdiag2+(1/n)*tr_t^2)/(((n+1)/n)*tr_t2+(1/n)*tr_t^2-((n+2)/n)*tr_tdiag2)
+    scov_o_variant = (1-rou_o_variant)*scov+rou_o_variant*f2
+    
+    # Method 12: sample analogue
+    rou_od = ((1/n)*tr_s2-(2/n)*tr_sdiag2+(1/n)*tr_s^2)/(((n+1)/n)*tr_s2+(1/n)*tr_s^2-((n+2)/n)*tr_sdiag2)
+    scov_od = (1-rou_od)*scov+rou_od*f2
+    
+    # Collect errors
+    err[1,'LW'] = get_err(scov_lw,cov)
+    err[1,'RBLW'] = get_err(scov_rblw,cov)
+    err[1,'SS'] = get_err(scov_ss,cov)
+    err[1,'OAS'] = get_err(scov_oas_constant,cov)
+    err[1,'OASD'] = get_err(scov_oas_variant,cov)
+    err[1,'s']=sum((scov-cov)^2)
+    err[1,'Oracle'] = get_err(scov_o_variant,cov)
+    err[1,'OB'] = get_err(scov_o_both,cov)
+    err[1,'OASB'] = get_err(scov_oas_both,cov)
+    err[1,'OD'] = get_err(scov_od,cov)
+    
+    return(err)
+  }
+  res = map_dfr(seq(1,5000), sim_err) %>% mutate(large = large)
+}
+res_sample_size = map_dfr(seq(large_min, large_max, 1),sim_diag,.progress=TRUE)
+saveRDS(res_sample_size, 'diag_5000.rds')
+result = res_sample_size %>% group_by(large) %>% summarise(across(everything(), ~mean(.))) %>% ungroup() %>% mutate(across(-c(s,large), ~(.data$s-.)/.data$s)*100)
+result = pivot_longer(result,cols=!large,names_to='method',values_to ='PRIAL') %>% mutate(ours = ifelse(method %in% c('OASD','OASB'),TRUE,FALSE))
+pl = ggplot(result %>% filter(method != 's'), aes(x=large,y=PRIAL,group=method,color=method, linetype=ours))+geom_line()+scale_linetype_manual(values = c("TRUE" = "solid", "FALSE" = "dashed")) + xlab(TeX(r'($sd$)')) + guides(linetype = "none")
+# ggplotly(pl)
+# ggsave('diag.jpg')
+# res_sample_size = readRDS('diag.rds')
+# # result = res_sample_size %>% group_by(large) %>% summarise(across(everything(), ~mean(.))) %>% ungroup() %>% mutate(across(-c(s,large), ~(.data$s-.)/.data$s)*100)
+# result_mean = res_sample_size %>% group_by(large) %>% summarise(across(everything(), ~mean(.))) %>% ungroup()
+# colnames(result_mean) = c('large',paste("mean", colnames(result_mean[,2:length(result_mean)]), sep = "_"))
+# result_sd = res_sample_size %>% group_by(large) %>% summarise(across(everything(), ~sd(.))) %>% ungroup()
+# colnames(result_sd) = paste("sd", colnames(result_sd), sep = "_")
+# result_tot = cbind(result_mean, result_sd[,2:ncol(result_sd)]) %>% 
+#   mutate(OASD_max = mean_OASD+1.96*(sd_OASD/sqrt(1000)),
+#          OAS_min = mean_OAS-1.96*(sd_OAS/sqrt(1000)),
+#          SS_min = mean_SS-1.96*(sd_SS/sqrt(1000)),
+#          RBLW_min = mean_RBLW-1.96*(sd_RBLW/sqrt(1000)),
+#          LW_min = mean_LW-1.96*(sd_LW/sqrt(1000)),
+#          s_min = mean_s-1.96*(sd_s/sqrt(1000)),
+#          OD_min = mean_OD-1.96*(sd_OD/sqrt(1000)),
+#          OB_min = mean_OB-1.96*(sd_OB/sqrt(1000)),
+#          OASB_min = mean_OASB-1.96*(sd_OASB/sqrt(1000)),
+#          Oracle_max = mean_Oracle+1.96*(sd_Oracle/sqrt(1000)))
+# result_filtered = result_tot %>% select(large, OASD_max, OAS_min, SS_min, RBLW_min, LW_min, s_min,OD_min,OB_min,OASB_min, Oracle_max) %>% mutate(across(-c(s_min,large), ~(.data$s_min-.)/.data$s_min)*100)
+# 
+# result_filtered = pivot_longer(result_filtered,cols=!large,names_to='method',values_to ='PRIAL')%>% mutate(ours = ifelse(method=='OASD',TRUE,FALSE))
+# pl = ggplot(result_filtered %>% filter(!method %in% c('s_min', 'RBLW_min','OB_min','OASB_min')), aes(x=large,y=PRIAL,group=method,color=method, linetype=ours))+geom_line()+scale_linetype_manual(values = c("TRUE" = "solid", "FALSE" = "dashed")) + xlab(TeX(r'($sd$)')) + guides(linetype = "none") + theme(
+#   text = element_text(size = 12),              # Global text size
+#   axis.title = element_text(size = 12),         # Axis titles
+#   axis.text = element_text(size = 12),          # Axis text
+#   plot.title = element_text(size = 12),         # Plot title
+#   legend.title = element_text(size = 12),       # Legend title
+#   legend.text = element_text(size = 12),         # Legend text
+#   legend.position = "bottom"
+# )
+```
+
+```{r shrinkage coefficient: diag}
+r = 0.5
+n = 18
+corr = matrix(0, ncol=p, nrow=p)
+for (i in 1:p){
+  for (j in 1:p){
+    corr[i,j]=r^abs(i-j)
+  }
+}
+
+
+sim <- function(large){
+  corr = matrix(0, ncol=p, nrow=p)
+  for (i in 1:p){
+    for (j in 1:p){
+      corr[i,j]=r^abs(i-j)
+    }
+  }
+  
+  sd = diag(c(rep(small,p/2),rep(large,p/2)))
+  cov = sd %*% corr %*% sd
+  sim_err <- function(iter){
+
+  err = data.frame(matrix(nrow=1,ncol=9))
+  colnames(err) = c('OASD','OAS', 'SS', 'RBLW','LW','OD','OB','OASB','Oracle')
+  
+  # Generate samples from N(0,cov)
+  sample = mvrnorm(n, rep(0,p), cov)
+  
+  # Estimate the covariance matrix
+  scov = (t(sample) %*% sample)/nrow(sample)
+  f1 = (sum(diag(scov))/p)*diag(p)
+  f2 = diag(diag(scov))
+  tr_s = sum(diag(scov))
+  tr_s2 = sum(diag(t(scov) %*% scov))
+  tr_sdiag2 = sum(diag(diag(diag(scov)) %*% diag(diag(scov))))
+  
+  tr_t = sum(diag(cov))
+  tr_t2 = sum(diag(t(cov) %*% cov))
+  tr_tdiag2 = sum(diag(diag(diag(cov)) %*% diag(diag(cov))))
+  
+  scorr = cov2cor(scov)
+  tr_s_cor = sum(diag(scorr))
+  tr_s2_cor = sum(diag(t(scorr) %*% scorr))
+  f1_cor = (sum(diag(scorr))/p)*diag(p)
+  sample_sc = sample %*% (diag(diag(f2)^(-1/2)))
+
+  # Method 2&3: LW & RBLW
+  num = 0
+  for (i in 1:n){
+    fill = sum((matrix(sample[i,],ncol=1) %*% matrix(sample[i,],nrow=1) - scov)^2)
+    num = num + fill
+  }
+  den = (n^2)*(tr_s2-(tr_s^2)/p)
+  rou_lw = num/den
+  rou_lw = min(rou_lw,1)
+  scov_lw = (1-rou_lw)*scov+rou_lw*f1
+
+  rou_rblw = (((n-2)/n)*tr_s2+tr_s^2)/((n+2)*(tr_s2-(tr_s^2)/p))
+  rou_rblw = min(rou_rblw,1)
+  
+  # Method 4: oas_c
+  phi = (tr_s2-(tr_s^2)/p)/(tr_s^2+(1-2/p)*tr_s2)
+  rou_oas_constant = min(1/((n+1-2/p)*phi),1)
+
+  # Method 5: oas_v
+  phi1 = (tr_s2-tr_sdiag2)/(tr_s2+tr_s^2-2*tr_sdiag2)
+  rou_oas_variant = min(1/((n+1)*phi1),1)
+  
+  # Method 8: Shafer(applied to correlation matrix)
+  v <- (1/(n*(n - 1))) * (crossprod(sample_sc^2) - (1/n) * (crossprod(sample_sc))^2)
+  diag(v) <- 0
+  d <- (scorr - diag(diag(scorr)))^2
+  rou_ss <- sum(v)/sum(d)
+  rou_ss <- max(min(rou_ss, 1), 0)
+  
+  # Method 9: Oracle_v
+  rou_o_variant = ((1/n)*tr_t2-(2/n)*tr_tdiag2+(1/n)*tr_t^2)/(((n+1)/n)*tr_t2+(1/n)*tr_t^2-((n+2)/n)*tr_tdiag2)
+  
+  # Method 9: Oracle_b
+    P = tr_tdiag2
+    R = tr_t2
+    Q = tr_t^2
+    
+    rou_b_o = (Q+R-2*P)/((n+1)*R+Q-(n+2)*P)
+    gamma_b_o = 1-(1/rou_b_o)*(((2/n)*P-(2/(n*p))*R)/(((n+2)/n)*P-(2/(n*p))*R-(1/p)*Q))
+    
+    # Method 10: oas_b
+    theta = rou_oas_variant
+    A = (tr_s^2)/p
+    B = tr_s2-tr_sdiag2
+    C = tr_sdiag2-A
+    
+    t1 = ((p-1)*C)/((p-1)*(A+C)-B)
+    t2 = (B-(p-1)*C)/((p-1)*(A+C)-B)
+    t3 = (n*p*C)/(2*(p-1)*(A+C)-2*B)
+    
+    if (abs(t3/((t1+t2)*theta+1-t1))<1){
+      gamma_oas = (theta-1)/(theta)
+    }else{
+      gamma_oas = (theta*(t3-t2)-1)/(theta*(t1+t3))
+    }
+    
+    # Method 11: oracle_v
+    rou_o_variant = ((1/n)*tr_t2-(2/n)*tr_tdiag2+(1/n)*tr_t^2)/(((n+1)/n)*tr_t2+(1/n)*tr_t^2-((n+2)/n)*tr_tdiag2)
+    
+    # Method 12: sample analogue
+    rou_od = ((1/n)*tr_s2-(2/n)*tr_sdiag2+(1/n)*tr_s^2)/(((n+1)/n)*tr_s2+(1/n)*tr_s^2-((n+2)/n)*tr_sdiag2)
+    
+    # Collect errors
+    err[1,'LW'] = rou_lw
+    err[1,'RBLW'] = rou_rblw
+    err[1,'SS'] = rou_ss
+    err[1,'OAS'] = rou_oas_constant
+    err[1,'OASD'] = rou_oas_variant
+    err[1,'Oracle'] = rou_o_variant
+    err[1,'OB'] = gamma_b_o
+    err[1,'OASB'] = gamma_oas
+    err[1,'OD'] = rou_od
+  
+  return(err)
+  }
+  res_sample_size = map_dfr(seq(1,1000),sim_err) %>% mutate(large=large)
+}
+res_sample_size = map_dfr(seq(large_min, large_max, 1),sim,.progress=TRUE)
+saveRDS(res_sample_size, 'coef_large.rds')
+# result = res_sample_size %>% group_by(n) %>% summarise(across(everything(), ~mean(.)))
+# result = pivot_longer(result,cols=!n,names_to='method',values_to ='rho') %>% mutate(ours = ifelse(method %in% c('OASD','OASB'),TRUE,FALSE))
+# pl = ggplot(result %>% filter(method != 's'), aes(x=n,y=rho,group=method,color=method, linetype=ours))+geom_line()+scale_linetype_manual(values = c("TRUE" = "solid", "FALSE" = "dashed")) + xlab(TeX(r'($n$)')) + ylab(TeX(r'($\rho$)'))+ guides(linetype = "none")
+# ggsave('coef_large.jpg')
+# ggplotly(pl)
+```
+
+```{r offdiag sparsity}
+large = 10
+n = 18
+
+sim_diag <- function(r){
+  
+  corr = matrix(0, ncol=p, nrow=p)
+  for (i in 1:p){
+    for (j in 1:p){
+      corr[i,j]=r^abs(i-j)
+    }
+  }
+  
+  sd = diag(c(rep(small,p/2),rep(large,p/2)))
+  cov = sd %*% corr %*% sd
+    
+  sim_err <- function(iter){
+
+    err = data.frame(matrix(nrow=1,ncol=10))
+    colnames(err) = c('OASD','OAS', 'SS', 'RBLW','LW','s','OD','OB','OASB','Oracle')
+    
+    # Generate samples from N(0,cov)
+    sample = mvrnorm(n, rep(0,p), cov)
+    
+    # Estimate the covariance matrix
+    scov = (t(sample) %*% sample)/nrow(sample)
+    f1 = (sum(diag(scov))/p)*diag(p)
+    f2 = diag(diag(scov))
+    tr_s = sum(diag(scov))
+    tr_s2 = sum(diag(t(scov) %*% scov))
+    tr_sdiag2 = sum(diag(diag(diag(scov)) %*% diag(diag(scov))))
+    
+    tr_t = sum(diag(cov))
+    tr_t2 = sum(diag(t(cov) %*% cov))
+    tr_tdiag2 = sum(diag(diag(diag(cov)) %*% diag(diag(cov))))
+    
+    scorr = cov2cor(scov)
+    tr_s_cor = sum(diag(scorr))
+    tr_s2_cor = sum(diag(t(scorr) %*% scorr))
+    f1_cor = (sum(diag(scorr))/p)*diag(p)
+    sample_sc = sample %*% (diag(diag(f2)^(-1/2)))
+    
+    # Method 2&3: LW & RBLW
+    num = 0
+    for (i in 1:n){
+      fill = sum((matrix(sample[i,],ncol=1) %*% matrix(sample[i,],nrow=1) - scov)^2)
+      num = num + fill
+    }
+    den = (n^2)*(tr_s2-(tr_s^2)/p)
+    rou_lw = num/den
+    rou_lw = min(rou_lw,1)
+    scov_lw = (1-rou_lw)*scov+rou_lw*f1
+
+    rou_rblw = (((n-2)/n)*tr_s2+tr_s^2)/((n+2)*(tr_s2-(tr_s^2)/p))
+    rou_rblw = min(rou_rblw,1)
+    scov_rblw = (1-rou_rblw)*scov+rou_rblw*f1
+    
+    # Method 4: oas_c
+    phi = (tr_s2-(tr_s^2)/p)/(tr_s^2+(1-2/p)*tr_s2)
+    rou_oas_constant = min(1/((n+1-2/p)*phi),1)
+    scov_oas_constant = (1-rou_oas_constant)*scov+rou_oas_constant*f1
+
+    # Method 5: oas_v
+    phi1 = (tr_s2-tr_sdiag2)/(tr_s2+tr_s^2-2*tr_sdiag2)
+    rou_oas_variant = min(1/((n+1)*phi1),1)
+    scov_oas_variant = (1-rou_oas_variant)*scov+rou_oas_variant*f2
+    
+    # Method 8: Shafer(applied to correlation matrix)
+    v <- (1/(n*(n - 1))) * (crossprod(sample_sc^2) - (1/n) * (crossprod(sample_sc))^2)
+    diag(v) <- 0
+    d <- (scorr - diag(diag(scorr)))^2
+    rou_ss <- sum(v)/sum(d)
+    rou_ss <- max(min(rou_ss, 1), 0)
+    scorr_ss = (1-rou_ss)*scorr+rou_ss*f1_cor
+    scov_ss = (f2^(1/2)) %*% scorr_ss %*% (f2^(1/2))
+    
+    # Method 9: Oracle_v
+    rou_o_variant = ((1/n)*tr_t2-(2/n)*tr_tdiag2+(1/n)*tr_t^2)/(((n+1)/n)*tr_t2+(1/n)*tr_t^2-((n+2)/n)*tr_tdiag2)
+    scov_o_variant = (1-rou_o_variant)*scov+rou_o_variant*f2
+    
+    # Method 9: Oracle_b
+    P = tr_tdiag2
+    R = tr_t2
+    Q = tr_t^2
+    
+    rou_b_o = (Q+R-2*P)/((n+1)*R+Q-(n+2)*P)
+    gamma_b_o = 1-(1/rou_b_o)*(((2/n)*P-(2/(n*p))*R)/(((n+2)/n)*P-(2/(n*p))*R-(1/p)*Q))
+    
+    scov_o_both = (1-rou_b_o)*scov+rou_b_o*(gamma_b_o*f2+(1-gamma_b_o)*f1)
+    
+    # Method 10: oas_b
+    theta = rou_oas_variant
+    A = (tr_s^2)/p
+    B = tr_s2-tr_sdiag2
+    C = tr_sdiag2-A
+    
+    t1 = ((p-1)*C)/((p-1)*(A+C)-B)
+    t2 = (B-(p-1)*C)/((p-1)*(A+C)-B)
+    t3 = (n*p*C)/(2*(p-1)*(A+C)-2*B)
+    
+    if (abs(t3/((t1+t2)*theta+1-t1))<1){
+      gamma_oas = (theta-1)/(theta)
+    }else{
+      gamma_oas = (theta*(t3-t2)-1)/(theta*(t1+t3))
+    }
+    
+    scov_oas_both = (1-theta)*scov+theta*(gamma_oas*f2+(1-gamma_oas)*f1)
+    
+    # Method 12: sample analogue
+    rou_od = ((1/n)*tr_s2-(2/n)*tr_sdiag2+(1/n)*tr_s^2)/(((n+1)/n)*tr_s2+(1/n)*tr_s^2-((n+2)/n)*tr_sdiag2)
+    scov_od = (1-rou_od)*scov+rou_od*f2
+    
+    # Collect errors
+    err[1,'LW'] = get_err(scov_lw,cov)
+    err[1,'RBLW'] = get_err(scov_rblw,cov)
+    err[1,'SS'] = get_err(scov_ss,cov)
+    err[1,'OAS'] = get_err(scov_oas_constant,cov)
+    err[1,'OASD'] = get_err(scov_oas_variant,cov)
+    err[1,'s']=sum((scov-cov)^2)
+    err[1,'Oracle'] = get_err(scov_o_variant,cov)
+    err[1,'OB'] = get_err(scov_o_both,cov)
+    err[1,'OASB'] = get_err(scov_oas_both,cov)
+    err[1,'OD'] = get_err(scov_od,cov)
+    
+    return(err)
+  }
+  res = map_dfr(seq(1,1000), sim_err) %>% mutate(r=r)
+}
+res_sample_size = map_dfr(seq(r_min, r_max, 0.1),sim_diag,.progress=TRUE)
+saveRDS(res_sample_size, 'r.rds')
+# result = res_sample_size %>% group_by(r) %>% summarise(across(everything(), ~mean(.))) %>% ungroup() %>% mutate(across(-c(s,r), ~(.data$s-.)/.data$s)*100)
+# result = pivot_longer(result,cols=!r,names_to='method',values_to ='PRIAL')%>% mutate(ours = ifelse(method %in% c('OASD','OASB'),TRUE,FALSE))
+# pl = ggplot(result %>% filter(method != 's'), aes(x=r,y=PRIAL,group=method,color=method, linetype=ours))+geom_line()+scale_linetype_manual(values = c("TRUE" = "solid", "FALSE" = "dashed")) + xlab(TeX(r'($r$)')) + guides(linetype = "none")
+# ggplotly(pl)
+# ggsave('r.jpg')
+res_sample_size = readRDS('r.rds')
+result_mean = res_sample_size %>% group_by(r) %>% summarise(across(everything(), ~mean(.))) %>% ungroup()
+colnames(result_mean) = c('r',paste("mean", colnames(result_mean[,2:length(result_mean)]), sep = "_"))
+result_sd = res_sample_size %>% group_by(r) %>% summarise(across(everything(), ~sd(.))) %>% ungroup()
+colnames(result_sd) = paste("sd", colnames(result_sd), sep = "_")
+result_tot = cbind(result_mean, result_sd[,2:ncol(result_sd)]) %>% 
+  mutate(OASD_max = mean_OASD+1.96*(sd_OASD/sqrt(1000)),
+         OAS_min = mean_OAS-1.96*(sd_OAS/sqrt(1000)),
+         SS_min = mean_SS-1.96*(sd_SS/sqrt(1000)),
+         RBLW_min = mean_RBLW-1.96*(sd_RBLW/sqrt(1000)),
+         LW_min = mean_LW-1.96*(sd_LW/sqrt(1000)),
+         s_min = mean_s-1.96*(sd_s/sqrt(1000)),
+         OD_min = mean_OD-1.96*(sd_OD/sqrt(1000)),
+         OB_min = mean_OB-1.96*(sd_OB/sqrt(1000)),
+         OASB_min = mean_OASB-1.96*(sd_OASB/sqrt(1000)),
+         Oracle_max = mean_Oracle+1.96*(sd_Oracle/sqrt(1000)))
+result_filtered = result_tot %>% select(r, OASD_max, OAS_min, SS_min, RBLW_min, LW_min, s_min,OD_min,OB_min,OASB_min, Oracle_max) %>% mutate(across(-c(s_min,r), ~(.data$s_min-.)/.data$s_min)*100)
+
+result_filtered = pivot_longer(result_filtered,cols=!r,names_to='method',values_to ='PRIAL')%>% mutate(ours = ifelse(method=='OASD',TRUE,FALSE))
+# result = res_sample_size %>% group_by(r) %>% summarise(across(everything(), ~mean(.))) %>% ungroup() %>% mutate(across(-c(s,r), ~(.data$s-.)/.data$s)*100)
+# result = pivot_longer(result,cols=!r,names_to='method',values_to ='PRIAL')%>% mutate(ours = ifelse(method=='OASD',TRUE,FALSE))
+pl = ggplot(result_filtered %>% filter(!method %in% c('s_min', 'RBLW_min','OB_min','OASB_min')), aes(x=r,y=PRIAL,group=method,color=method, linetype=ours))+geom_line()+scale_linetype_manual(values = c("TRUE" = "solid", "FALSE" = "dashed")) + xlab(TeX(r'($r$)')) + guides(linetype = "none") + theme(
+#   text = element_text(size = 12),              # Global text size
+#   axis.title = element_text(size = 12),         # Axis titles
+#   axis.text = element_text(size = 12),          # Axis text
+#   plot.title = element_text(size = 12),         # Plot title
+#   legend.title = element_text(size = 12),       # Legend title
+#   legend.text = element_text(size = 12),         # Legend text
+#   legend.position = "bottom"
+# )
+```
+
+```{r shrinkage coefficient: r}
+large = 10
+n = 18
+
+
+sim <- function(r){
+  corr = matrix(0, ncol=p, nrow=p)
+  for (i in 1:p){
+    for (j in 1:p){
+      corr[i,j]=r^abs(i-j)
+    }
+  }
+  
+  sd = diag(c(rep(small,p/2),rep(large,p/2)))
+  cov = sd %*% corr %*% sd
+  sim_err <- function(iter){
+
+  err = data.frame(matrix(nrow=1,ncol=9))
+  colnames(err) = c('OASD','OAS', 'SS', 'RBLW','LW','OD','OB','OASB','Oracle')
+  
+  # Generate samples from N(0,cov)
+  sample = mvrnorm(n, rep(0,p), cov)
+  
+  # Estimate the covariance matrix
+  scov = (t(sample) %*% sample)/nrow(sample)
+  f1 = (sum(diag(scov))/p)*diag(p)
+  f2 = diag(diag(scov))
+  tr_s = sum(diag(scov))
+  tr_s2 = sum(diag(t(scov) %*% scov))
+  tr_sdiag2 = sum(diag(diag(diag(scov)) %*% diag(diag(scov))))
+  
+  tr_t = sum(diag(cov))
+  tr_t2 = sum(diag(t(cov) %*% cov))
+  tr_tdiag2 = sum(diag(diag(diag(cov)) %*% diag(diag(cov))))
+  
+  scorr = cov2cor(scov)
+  tr_s_cor = sum(diag(scorr))
+  tr_s2_cor = sum(diag(t(scorr) %*% scorr))
+  f1_cor = (sum(diag(scorr))/p)*diag(p)
+  sample_sc = sample %*% (diag(diag(f2)^(-1/2)))
+
+  # Method 2&3: LW & RBLW
+  num = 0
+  for (i in 1:n){
+    fill = sum((matrix(sample[i,],ncol=1) %*% matrix(sample[i,],nrow=1) - scov)^2)
+    num = num + fill
+  }
+  den = (n^2)*(tr_s2-(tr_s^2)/p)
+  rou_lw = num/den
+  rou_lw = min(rou_lw,1)
+  scov_lw = (1-rou_lw)*scov+rou_lw*f1
+
+  rou_rblw = (((n-2)/n)*tr_s2+tr_s^2)/((n+2)*(tr_s2-(tr_s^2)/p))
+  rou_rblw = min(rou_rblw,1)
+  
+  # Method 4: oas_c
+  phi = (tr_s2-(tr_s^2)/p)/(tr_s^2+(1-2/p)*tr_s2)
+  rou_oas_constant = min(1/((n+1-2/p)*phi),1)
+
+  # Method 5: oas_v
+  phi1 = (tr_s2-tr_sdiag2)/(tr_s2+tr_s^2-2*tr_sdiag2)
+  rou_oas_variant = min(1/((n+1)*phi1),1)
+  
+  # Method 8: Shafer(applied to correlation matrix)
+  v <- (1/(n*(n - 1))) * (crossprod(sample_sc^2) - (1/n) * (crossprod(sample_sc))^2)
+  diag(v) <- 0
+  d <- (scorr - diag(diag(scorr)))^2
+  rou_ss <- sum(v)/sum(d)
+  rou_ss <- max(min(rou_ss, 1), 0)
+  
+  # Method 9: Oracle_v
+  rou_o_variant = ((1/n)*tr_t2-(2/n)*tr_tdiag2+(1/n)*tr_t^2)/(((n+1)/n)*tr_t2+(1/n)*tr_t^2-((n+2)/n)*tr_tdiag2)
+  
+  # Method 9: Oracle_b
+    P = tr_tdiag2
+    R = tr_t2
+    Q = tr_t^2
+    
+    rou_b_o = (Q+R-2*P)/((n+1)*R+Q-(n+2)*P)
+    gamma_b_o = 1-(1/rou_b_o)*(((2/n)*P-(2/(n*p))*R)/(((n+2)/n)*P-(2/(n*p))*R-(1/p)*Q))
+    
+    # Method 10: oas_b
+    theta = rou_oas_variant
+    A = (tr_s^2)/p
+    B = tr_s2-tr_sdiag2
+    C = tr_sdiag2-A
+    
+    t1 = ((p-1)*C)/((p-1)*(A+C)-B)
+    t2 = (B-(p-1)*C)/((p-1)*(A+C)-B)
+    t3 = (n*p*C)/(2*(p-1)*(A+C)-2*B)
+    
+    if (abs(t3/((t1+t2)*theta+1-t1))<1){
+      gamma_oas = (theta-1)/(theta)
+    }else{
+      gamma_oas = (theta*(t3-t2)-1)/(theta*(t1+t3))
+    }
+    
+    # Method 11: oracle_v
+    rou_o_variant = ((1/n)*tr_t2-(2/n)*tr_tdiag2+(1/n)*tr_t^2)/(((n+1)/n)*tr_t2+(1/n)*tr_t^2-((n+2)/n)*tr_tdiag2)
+    
+    # Method 12: sample analogue
+    rou_od = ((1/n)*tr_s2-(2/n)*tr_sdiag2+(1/n)*tr_s^2)/(((n+1)/n)*tr_s2+(1/n)*tr_s^2-((n+2)/n)*tr_sdiag2)
+    
+    # Collect errors
+    err[1,'LW'] = rou_lw
+    err[1,'RBLW'] = rou_rblw
+    err[1,'SS'] = rou_ss
+    err[1,'OAS'] = rou_oas_constant
+    err[1,'OASD'] = rou_oas_variant
+    err[1,'Oracle'] = rou_o_variant
+    err[1,'OB'] = gamma_b_o
+    err[1,'OASB'] = gamma_oas
+    err[1,'OD'] = rou_od
+  
+  return(err)
+  }
+  res_sample_size = map_dfr(seq(1,1000),sim_err) %>% mutate(r=r)
+}
+res_sample_size = map_dfr(seq(r_min, r_max, 0.1),sim,.progress=TRUE)
+saveRDS(res_sample_size, 'coef_r.rds')
+# result = res_sample_size %>% group_by(n) %>% summarise(across(everything(), ~mean(.)))
+# result = pivot_longer(result,cols=!n,names_to='method',values_to ='rho') %>% mutate(ours = ifelse(method %in% c('OASD','OASB'),TRUE,FALSE))
+# pl = ggplot(result %>% filter(method != 's'), aes(x=n,y=rho,group=method,color=method, linetype=ours))+geom_line()+scale_linetype_manual(values = c("TRUE" = "solid", "FALSE" = "dashed")) + xlab(TeX(r'($n$)')) + ylab(TeX(r'($\rho$)'))+ guides(linetype = "none")
+# ggsave('coef_large.jpg')
+# ggplotly(pl)
+```
+
+```{r sample size}
+small = 1
+large = 10
+r = 0.5
+
+corr = matrix(0, ncol=p, nrow=p)
+for (i in 1:p){
+  for (j in 1:p){
+    corr[i,j]=r^abs(i-j)
+  }
+}
+sd = diag(c(rep(small,p/2),rep(large,p/2)))
+cov = sd %*% corr %*% sd
+
+sim_diag <- function(n){
+    
+  sim_err <- function(iter){
+
+    err = data.frame(matrix(nrow=1,ncol=10))
+    colnames(err) = c('OASD','OAS', 'SS', 'RBLW','LW','s','OD','OB','OASB','Oracle')
+    
+    # Generate samples from N(0,cov)
+    sample = mvrnorm(n, rep(0,p), cov)
+    
+    # Estimate the covariance matrix
+    scov = (t(sample) %*% sample)/nrow(sample)
+    f1 = (sum(diag(scov))/p)*diag(p)
+    f2 = diag(diag(scov))
+    tr_s = sum(diag(scov))
+    tr_s2 = sum(diag(t(scov) %*% scov))
+    tr_sdiag2 = sum(diag(diag(diag(scov)) %*% diag(diag(scov))))
+    
+    tr_t = sum(diag(cov))
+    tr_t2 = sum(diag(t(cov) %*% cov))
+    tr_tdiag2 = sum(diag(diag(diag(cov)) %*% diag(diag(cov))))
+    
+    scorr = cov2cor(scov)
+    tr_s_cor = sum(diag(scorr))
+    tr_s2_cor = sum(diag(t(scorr) %*% scorr))
+    f1_cor = (sum(diag(scorr))/p)*diag(p)
+    sample_sc = sample %*% (diag(diag(f2)^(-1/2)))
+    
+    # Method 2&3: LW & RBLW
+    num = 0
+    for (i in 1:n){
+      fill = sum((matrix(sample[i,],ncol=1) %*% matrix(sample[i,],nrow=1) - scov)^2)
+      num = num + fill
+    }
+    den = (n^2)*(tr_s2-(tr_s^2)/p)
+    rou_lw = num/den
+    rou_lw = min(rou_lw,1)
+    scov_lw = (1-rou_lw)*scov+rou_lw*f1
+
+    rou_rblw = (((n-2)/n)*tr_s2+tr_s^2)/((n+2)*(tr_s2-(tr_s^2)/p))
+    rou_rblw = min(rou_rblw,1)
+    scov_rblw = (1-rou_rblw)*scov+rou_rblw*f1
+    
+    # Method 4: oas_c
+    phi = (tr_s2-(tr_s^2)/p)/(tr_s^2+(1-2/p)*tr_s2)
+    rou_oas_constant = min(1/((n+1-2/p)*phi),1)
+    scov_oas_constant = (1-rou_oas_constant)*scov+rou_oas_constant*f1
+
+    # Method 5: oas_v
+    phi1 = (tr_s2-tr_sdiag2)/(tr_s2+tr_s^2-2*tr_sdiag2)
+    rou_oas_variant = min(1/((n+1)*phi1),1)
+    scov_oas_variant = (1-rou_oas_variant)*scov+rou_oas_variant*f2
+    
+    # Method 8: Shafer(applied to correlation matrix)
+    v <- (1/(n*(n - 1))) * (crossprod(sample_sc^2) - (1/n) * (crossprod(sample_sc))^2)
+    diag(v) <- 0
+    d <- (scorr - diag(diag(scorr)))^2
+    rou_ss <- sum(v)/sum(d)
+    rou_ss <- max(min(rou_ss, 1), 0)
+    scorr_ss = (1-rou_ss)*scorr+rou_ss*f1_cor
+    scov_ss = (f2^(1/2)) %*% scorr_ss %*% (f2^(1/2))
+    
+    # Method 9: Oracle_v
+    rou_o_variant = ((1/n)*tr_t2-(2/n)*tr_tdiag2+(1/n)*tr_t^2)/(((n+1)/n)*tr_t2+(1/n)*tr_t^2-((n+2)/n)*tr_tdiag2)
+    scov_o_variant = (1-rou_o_variant)*scov+rou_o_variant*f2
+    
+    # Method 9: Oracle_b
+    P = tr_tdiag2
+    R = tr_t2
+    Q = tr_t^2
+    
+    rou_b_o = (Q+R-2*P)/((n+1)*R+Q-(n+2)*P)
+    gamma_b_o = 1-(1/rou_b_o)*(((2/n)*P-(2/(n*p))*R)/(((n+2)/n)*P-(2/(n*p))*R-(1/p)*Q))
+    
+    scov_o_both = (1-rou_b_o)*scov+rou_b_o*(gamma_b_o*f2+(1-gamma_b_o)*f1)
+    
+    # Method 10: oas_b
+    theta = rou_oas_variant
+    A = (tr_s^2)/p
+    B = tr_s2-tr_sdiag2
+    C = tr_sdiag2-A
+    
+    t1 = ((p-1)*C)/((p-1)*(A+C)-B)
+    t2 = (B-(p-1)*C)/((p-1)*(A+C)-B)
+    t3 = (n*p*C)/(2*(p-1)*(A+C)-2*B)
+    
+    if (abs(t3/((t1+t2)*theta+1-t1))<1){
+      gamma_oas = (theta-1)/(theta)
+    }else{
+      gamma_oas = (theta*(t3-t2)-1)/(theta*(t1+t3))
+    }
+    
+    scov_oas_both = (1-theta)*scov+theta*(gamma_oas*f2+(1-gamma_oas)*f1)
+    
+    # Method 12: sample analogue
+    rou_od = ((1/n)*tr_s2-(2/n)*tr_sdiag2+(1/n)*tr_s^2)/(((n+1)/n)*tr_s2+(1/n)*tr_s^2-((n+2)/n)*tr_sdiag2)
+    scov_od = (1-rou_od)*scov+rou_od*f2
+    
+    
+    # Collect errors
+    err[1,'LW'] = get_err(scov_lw,cov)
+    err[1,'RBLW'] = get_err(scov_rblw,cov)
+    err[1,'SS'] = get_err(scov_ss,cov)
+    err[1,'OAS'] = get_err(scov_oas_constant,cov)
+    err[1,'OASD'] = get_err(scov_oas_variant,cov)
+    err[1,'s']=sum((scov-cov)^2)
+    err[1,'Oracle'] = get_err(scov_o_variant,cov)
+    err[1,'OB'] = get_err(scov_o_both,cov)
+    err[1,'OASB'] = get_err(scov_oas_both,cov)
+    err[1,'OD'] = get_err(scov_od,cov)
+    
+    return(err)
+  }
+  res = map_dfr(seq(1,1000), sim_err) %>% mutate(n=n)
+}
+res_sample_size = map_dfr(seq(n_min, 2000, 100),sim_diag,.progress=TRUE)
+saveRDS(res_sample_size, 'n*.rds')
+result = res_sample_size %>% group_by(n) %>% summarise(across(everything(), ~mean(.))) %>% ungroup() %>% mutate(across(-c(s,n), ~(.data$s-.)/.data$s)*100)
+result = pivot_longer(result,cols=!n,names_to='method',values_to ='PRIAL')%>% mutate(ours = ifelse(method %in% c('OASD','OASB'),TRUE,FALSE))
+pl = ggplot(result %>% filter(!method %in% c('s','OASB','OB','RBLW')), aes(x=n,y=PRIAL,group=method,color=method, linetype=ours))+geom_line()+scale_linetype_manual(values = c("TRUE" = "solid", "FALSE" = "dashed")) + xlab(TeX(r'($n$)')) + guides(linetype = "none")
+ggplotly(pl)
+ggsave('n*.jpg')
+
+res_sample_size = readRDS('n.rds')
+result_mean = res_sample_size %>% group_by(n) %>% summarise(across(everything(), ~mean(.))) %>% ungroup()
+colnames(result_mean) = c('n',paste("mean", colnames(result_mean[,2:length(result_mean)]), sep = "_"))
+result_sd = res_sample_size %>% group_by(n) %>% summarise(across(everything(), ~sd(.))) %>% ungroup()
+colnames(result_sd) = paste("sd", colnames(result_sd), sep = "_")
+result_tot = cbind(result_mean, result_sd[,2:ncol(result_sd)]) %>% 
+  mutate(OASD_max = mean_OASD+1.96*(sd_OASD/sqrt(1000)),
+         OAS_min = mean_OAS-1.96*(sd_OAS/sqrt(1000)),
+         SS_min = mean_SS-1.96*(sd_SS/sqrt(1000)),
+         RBLW_min = mean_RBLW-1.96*(sd_RBLW/sqrt(1000)),
+         LW_min = mean_LW-1.96*(sd_LW/sqrt(1000)),
+         s_min = mean_s-1.96*(sd_s/sqrt(1000)),
+         OD_min = mean_OD-1.96*(sd_OD/sqrt(1000)),
+         OB_min = mean_OB-1.96*(sd_OB/sqrt(1000)),
+         OASB_min = mean_OASB-1.96*(sd_OASB/sqrt(1000)),
+         Oracle_max = mean_Oracle+1.96*(sd_Oracle/sqrt(1000)))
+result_filtered = result_tot %>% select(n, OASD_max, OAS_min, SS_min, RBLW_min, LW_min, s_min,OD_min,OB_min,OASB_min, Oracle_max) %>% mutate(across(-c(s_min,n), ~(.data$s_min-.)/.data$s_min)*100)
+
+result_filtered = pivot_longer(result_filtered,cols=!n,names_to='method',values_to ='PRIAL')%>% mutate(ours = ifelse(method=='OASD',TRUE,FALSE))
+# result = res_sample_size %>% group_by(n) %>% summarise(across(everything(), ~mean(.))) %>% ungroup() %>% mutate(across(-c(s,n), ~(.data$s-.)/.data$s)*100)
+# result = pivot_longer(result,cols=!n,names_to='method',values_to ='PRIAL')%>% mutate(ours = ifelse(method=='OASD',TRUE,FALSE))
+pl = ggplot(result_filtered %>% filter(!method %in% c('s_min', 'RBLW_min','OB_min','OASB_min')), aes(x=n,y=PRIAL,group=method,color=method, linetype=ours))+geom_line()+scale_linetype_manual(values = c("TRUE" = "solid", "FALSE" = "dashed")) + xlab(TeX(r'($n$)')) + guides(linetype = "none") + theme(
+  text = element_text(size = 12),              # Global text size
+  axis.title = element_text(size = 12),         # Axis titles
+  axis.text = element_text(size = 12),          # Axis text
+  plot.title = element_text(size = 12),         # Plot title
+  legend.title = element_text(size = 12),       # Legend title
+  legend.text = element_text(size = 12),         # Legend text
+  legend.position = "bottom"
+)
+```
+
+
+```{r shrinkage coefficient: n}
+small = 1
+large = 10
+r = 0.5
+
+corr = matrix(0, ncol=p, nrow=p)
+for (i in 1:p){
+  for (j in 1:p){
+    corr[i,j]=r^abs(i-j)
+  }
+}
+sd = diag(c(rep(small,p/2),rep(large,p/2)))
+cov = sd %*% corr %*% sd
+
+sim <- function(n){
+  sim_err <- function(iter){
+
+  err = data.frame(matrix(nrow=1,ncol=9))
+  colnames(err) = c('OASD','OAS', 'SS', 'RBLW','LW','OD','OB','OASB','Oracle')
+  
+  # Generate samples from N(0,cov)
+  sample = mvrnorm(n, rep(0,p), cov)
+  
+  # Estimate the covariance matrix
+  scov = (t(sample) %*% sample)/nrow(sample)
+  f1 = (sum(diag(scov))/p)*diag(p)
+  f2 = diag(diag(scov))
+  tr_s = sum(diag(scov))
+  tr_s2 = sum(diag(t(scov) %*% scov))
+  tr_sdiag2 = sum(diag(diag(diag(scov)) %*% diag(diag(scov))))
+  
+  tr_t = sum(diag(cov))
+  tr_t2 = sum(diag(t(cov) %*% cov))
+  tr_tdiag2 = sum(diag(diag(diag(cov)) %*% diag(diag(cov))))
+  
+  scorr = cov2cor(scov)
+  tr_s_cor = sum(diag(scorr))
+  tr_s2_cor = sum(diag(t(scorr) %*% scorr))
+  f1_cor = (sum(diag(scorr))/p)*diag(p)
+  sample_sc = sample %*% (diag(diag(f2)^(-1/2)))
+
+  # Method 2&3: LW & RBLW
+  num = 0
+  for (i in 1:n){
+    fill = sum((matrix(sample[i,],ncol=1) %*% matrix(sample[i,],nrow=1) - scov)^2)
+    num = num + fill
+  }
+  den = (n^2)*(tr_s2-(tr_s^2)/p)
+  rou_lw = num/den
+  rou_lw = min(rou_lw,1)
+  scov_lw = (1-rou_lw)*scov+rou_lw*f1
+
+  rou_rblw = (((n-2)/n)*tr_s2+tr_s^2)/((n+2)*(tr_s2-(tr_s^2)/p))
+  rou_rblw = min(rou_rblw,1)
+  
+  # Method 4: oas_c
+  phi = (tr_s2-(tr_s^2)/p)/(tr_s^2+(1-2/p)*tr_s2)
+  rou_oas_constant = min(1/((n+1-2/p)*phi),1)
+
+  # Method 5: oas_v
+  phi1 = (tr_s2-tr_sdiag2)/(tr_s2+tr_s^2-2*tr_sdiag2)
+  rou_oas_variant = min(1/((n+1)*phi1),1)
+  
+  # Method 8: Shafer(applied to correlation matrix)
+  v <- (1/(n*(n - 1))) * (crossprod(sample_sc^2) - (1/n) * (crossprod(sample_sc))^2)
+  diag(v) <- 0
+  d <- (scorr - diag(diag(scorr)))^2
+  rou_ss <- sum(v)/sum(d)
+  rou_ss <- max(min(rou_ss, 1), 0)
+  
+  # Method 9: Oracle_v
+  rou_o_variant = ((1/n)*tr_t2-(2/n)*tr_tdiag2+(1/n)*tr_t^2)/(((n+1)/n)*tr_t2+(1/n)*tr_t^2-((n+2)/n)*tr_tdiag2)
+  
+  # Method 9: Oracle_b
+    P = tr_tdiag2
+    R = tr_t2
+    Q = tr_t^2
+    
+    rou_b_o = (Q+R-2*P)/((n+1)*R+Q-(n+2)*P)
+    gamma_b_o = 1-(1/rou_b_o)*(((2/n)*P-(2/(n*p))*R)/(((n+2)/n)*P-(2/(n*p))*R-(1/p)*Q))
+    
+    # Method 10: oas_b
+    theta = rou_oas_variant
+    A = (tr_s^2)/p
+    B = tr_s2-tr_sdiag2
+    C = tr_sdiag2-A
+    
+    t1 = ((p-1)*C)/((p-1)*(A+C)-B)
+    t2 = (B-(p-1)*C)/((p-1)*(A+C)-B)
+    t3 = (n*p*C)/(2*(p-1)*(A+C)-2*B)
+    
+    if (abs(t3/((t1+t2)*theta+1-t1))<1){
+      gamma_oas = (theta-1)/(theta)
+    }else{
+      gamma_oas = (theta*(t3-t2)-1)/(theta*(t1+t3))
+    }
+    
+    # Method 11: oracle_v
+    rou_o_variant = ((1/n)*tr_t2-(2/n)*tr_tdiag2+(1/n)*tr_t^2)/(((n+1)/n)*tr_t2+(1/n)*tr_t^2-((n+2)/n)*tr_tdiag2)
+    
+    # Method 12: sample analogue
+    rou_od = ((1/n)*tr_s2-(2/n)*tr_sdiag2+(1/n)*tr_s^2)/(((n+1)/n)*tr_s2+(1/n)*tr_s^2-((n+2)/n)*tr_sdiag2)
+    
+    # Collect errors
+    err[1,'LW'] = rou_lw
+    err[1,'RBLW'] = rou_rblw
+    err[1,'SS'] = rou_ss
+    err[1,'OAS'] = rou_oas_constant
+    err[1,'OASD'] = rou_oas_variant
+    err[1,'Oracle'] = rou_o_variant
+    err[1,'OB'] = gamma_b_o
+    err[1,'OASB'] = gamma_oas
+    err[1,'OD'] = rou_od
+  
+  return(err)
+  }
+  res_sample_size = map_dfr(seq(1,1000),sim_err) %>% mutate(n=n)
+}
+res_sample_size = map_dfr(seq(n_min, n_max, 1),sim,.progress=TRUE)
+saveRDS(res_sample_size, 'coef_n.rds')
+# result = res_sample_size %>% group_by(n) %>% summarise(across(everything(), ~mean(.)))
+# result = pivot_longer(result,cols=!n,names_to='method',values_to ='rho') %>% mutate(ours = ifelse(method %in% c('OASD','OASB'),TRUE,FALSE))
+# pl = ggplot(result %>% filter(method != 's'), aes(x=n,y=rho,group=method,color=method, linetype=ours))+geom_line()+scale_linetype_manual(values = c("TRUE" = "solid", "FALSE" = "dashed")) + xlab(TeX(r'($n$)')) + ylab(TeX(r'($\rho$)'))+ guides(linetype = "none")
+# ggsave('coef_large.jpg')
+# ggplotly(pl)
+```
+
+
+```{r sample size* where two targets have an advantage}
+small = 1
+large = 1
+r = 0.2
+
+corr = matrix(0, ncol=p, nrow=p)
+for (i in 1:p){
+  for (j in 1:p){
+    corr[i,j]=r^abs(i-j)
+  }
+}
+sd = diag(c(rep(small,p/2),rep(large,p/2)))
+cov = sd %*% corr %*% sd
+
+sim_diag <- function(n){
+    
+  sim_err <- function(iter){
+
+    err = data.frame(matrix(nrow=1,ncol=9))
+    colnames(err) = c('OASD','OAS', 'SS', 'RBLW','LW','s','OD','OB','OASB')
+    
+    # Generate samples from N(0,cov)
+    sample = mvrnorm(n, rep(0,p), cov)
+    
+    # Estimate the covariance matrix
+    scov = (t(sample) %*% sample)/nrow(sample)
+    f1 = (sum(diag(scov))/p)*diag(p)
+    f2 = diag(diag(scov))
+    tr_s = sum(diag(scov))
+    tr_s2 = sum(diag(t(scov) %*% scov))
+    tr_sdiag2 = sum(diag(diag(diag(scov)) %*% diag(diag(scov))))
+    
+    tr_t = sum(diag(cov))
+    tr_t2 = sum(diag(t(cov) %*% cov))
+    tr_tdiag2 = sum(diag(diag(diag(cov)) %*% diag(diag(cov))))
+    
+    scorr = cov2cor(scov)
+    tr_s_cor = sum(diag(scorr))
+    tr_s2_cor = sum(diag(t(scorr) %*% scorr))
+    f1_cor = (sum(diag(scorr))/p)*diag(p)
+    sample_sc = sample %*% (diag(diag(f2)^(-1/2)))
+    
+    # Method 2&3: LW & RBLW
+    num = 0
+    for (i in 1:n){
+      fill = sum((matrix(sample[i,],ncol=1) %*% matrix(sample[i,],nrow=1) - scov)^2)
+      num = num + fill
+    }
+    den = (n^2)*(tr_s2-(tr_s^2)/p)
+    rou_lw = num/den
+    rou_lw = min(rou_lw,1)
+    scov_lw = (1-rou_lw)*scov+rou_lw*f1
+
+    rou_rblw = (((n-2)/n)*tr_s2+tr_s^2)/((n+2)*(tr_s2-(tr_s^2)/p))
+    rou_rblw = min(rou_rblw,1)
+    scov_rblw = (1-rou_rblw)*scov+rou_rblw*f1
+    
+    # Method 4: oas_c
+    phi = (tr_s2-(tr_s^2)/p)/(tr_s^2+(1-2/p)*tr_s2)
+    rou_oas_constant = min(1/((n+1-2/p)*phi),1)
+    scov_oas_constant = (1-rou_oas_constant)*scov+rou_oas_constant*f1
+
+    # Method 5: oas_v
+    phi1 = (tr_s2-tr_sdiag2)/(tr_s2+tr_s^2-2*tr_sdiag2)
+    rou_oas_variant = min(1/((n+1)*phi1),1)
+    scov_oas_variant = (1-rou_oas_variant)*scov+rou_oas_variant*f2
+    
+    # Method 8: Shafer(applied to correlation matrix)
+    v <- (1/(n*(n - 1))) * (crossprod(sample_sc^2) - (1/n) * (crossprod(sample_sc))^2)
+    diag(v) <- 0
+    d <- (scorr - diag(diag(scorr)))^2
+    rou_ss <- sum(v)/sum(d)
+    rou_ss <- max(min(rou_ss, 1), 0)
+    scorr_ss = (1-rou_ss)*scorr+rou_ss*f1_cor
+    scov_ss = (f2^(1/2)) %*% scorr_ss %*% (f2^(1/2))
+    
+    # Method 9: Oracle_v
+    rou_o_variant = ((1/n)*tr_t2-(2/n)*tr_tdiag2+(1/n)*tr_t^2)/(((n+1)/n)*tr_t2+(1/n)*tr_t^2-((n+2)/n)*tr_tdiag2)
+    scov_o_variant = (1-rou_o_variant)*scov+rou_o_variant*f2
+    
+    # Method 9: Oracle_b
+    P = tr_tdiag2
+    R = tr_t2
+    Q = tr_t^2
+    
+    rou_b_o = (Q+R-2*P)/((n+1)*R+Q-(n+2)*P)
+    gamma_b_o = 1-(1/rou_b_o)*(((2/n)*P-(2/(n*p))*R)/(((n+2)/n)*P-(2/(n*p))*R-(1/p)*Q))
+    
+    scov_o_both = (1-rou_b_o)*scov+rou_b_o*(gamma_b_o*f2+(1-gamma_b_o)*f1)
+    
+    # Method 10: oas_b
+    theta = rou_oas_variant
+    A = (tr_s^2)/p
+    B = tr_s2-tr_sdiag2
+    C = tr_sdiag2-A
+    
+    t1 = ((p-1)*C)/((p-1)*(A+C)-B)
+    t2 = (B-(p-1)*C)/((p-1)*(A+C)-B)
+    t3 = (n*p*C)/(2*(p-1)*(A+C)-2*B)
+    
+    if (abs(t3/((t1+t2)*theta+1-t1))<1){
+      gamma_oas = (theta-1)/(theta)
+    }else{
+      gamma_oas = (theta*(t3-t2)-1)/(theta*(t1+t3))
+    }
+    
+    scov_oas_both = (1-theta)*scov+theta*(gamma_oas*f2+(1-gamma_oas)*f1)
+    
+    
+    # Collect errors
+    err[1,'LW'] = get_err(scov_lw,cov)
+    err[1,'RBLW'] = get_err(scov_rblw,cov)
+    err[1,'SS'] = get_err(scov_ss,cov)
+    err[1,'OAS'] = get_err(scov_oas_constant,cov)
+    err[1,'OASD'] = get_err(scov_oas_variant,cov)
+    err[1,'s']=sum((scov-cov)^2)
+    err[1,'OD'] = get_err(scov_o_variant,cov)
+    err[1,'OB'] = get_err(scov_o_both,cov)
+    err[1,'OASB'] = get_err(scov_oas_both,cov)
+    
+    return(err)
+  }
+  res = map_dfr(seq(1,1000), sim_err) %>% mutate(n=n)
+}
+res_sample_size = map_dfr(seq(n_min, n_max, 1),sim_diag,.progress=TRUE)
+saveRDS(res_sample_size, 'n*.rds')
+result = res_sample_size %>% group_by(n) %>% summarise(across(everything(), ~mean(.))) %>% ungroup() %>% mutate(across(-c(s,n), ~(.data$s-.)/.data$s)*100)
+result = pivot_longer(result,cols=!n,names_to='method',values_to ='PRIAL')%>% mutate(ours = ifelse(method %in% c('OASD','OASB'),TRUE,FALSE))
+pl = ggplot(result %>% filter(method != 's'), aes(x=n,y=PRIAL,group=method,color=method, linetype=ours))+geom_line()+scale_linetype_manual(values = c("TRUE" = "solid", "FALSE" = "dashed")) + xlab(TeX(r'($n$)')) + guides(linetype = "none")
+ggplotly(pl)
+ggsave('n*.jpg')
+```
+
+
+```{r understand results: shrinkage coefficient}
+small = 1
+large = 1
+r = 0.2
+
+
+sim <- function(n){
+  corr = matrix(0, ncol=p, nrow=p)
+  for (i in 1:p){
+    for (j in 1:p){
+      corr[i,j]=r^abs(i-j)
+    }
+  }
+  
+  sd = diag(c(rep(small,p/2),rep(large,p/2)))
+  cov = sd %*% corr %*% sd
+  sim_err <- function(iter){
+
+  err = data.frame(matrix(nrow=1,ncol=8))
+  colnames(err) = c('OASD','OAS', 'SS', 'RBLW','LW','OD','OB','OASB')
+  
+  # Generate samples from N(0,cov)
+  sample = mvrnorm(n, rep(0,p), cov)
+  
+  # Estimate the covariance matrix
+  scov = (t(sample) %*% sample)/nrow(sample)
+  f1 = (sum(diag(scov))/p)*diag(p)
+  f2 = diag(diag(scov))
+  tr_s = sum(diag(scov))
+  tr_s2 = sum(diag(t(scov) %*% scov))
+  tr_sdiag2 = sum(diag(diag(diag(scov)) %*% diag(diag(scov))))
+  
+  tr_t = sum(diag(cov))
+  tr_t2 = sum(diag(t(cov) %*% cov))
+  tr_tdiag2 = sum(diag(diag(diag(cov)) %*% diag(diag(cov))))
+  
+  scorr = cov2cor(scov)
+  tr_s_cor = sum(diag(scorr))
+  tr_s2_cor = sum(diag(t(scorr) %*% scorr))
+  f1_cor = (sum(diag(scorr))/p)*diag(p)
+  sample_sc = sample %*% (diag(diag(f2)^(-1/2)))
+
+  # Method 2&3: LW & RBLW
+  num = 0
+  for (i in 1:n){
+    fill = sum((matrix(sample[i,],ncol=1) %*% matrix(sample[i,],nrow=1) - scov)^2)
+    num = num + fill
+  }
+  den = (n^2)*(tr_s2-(tr_s^2)/p)
+  rou_lw = num/den
+  rou_lw = min(rou_lw,1)
+  scov_lw = (1-rou_lw)*scov+rou_lw*f1
+
+  rou_rblw = (((n-2)/n)*tr_s2+tr_s^2)/((n+2)*(tr_s2-(tr_s^2)/p))
+  rou_rblw = min(rou_rblw,1)
+  
+  # Method 4: oas_c
+  phi = (tr_s2-(tr_s^2)/p)/(tr_s^2+(1-2/p)*tr_s2)
+  rou_oas_constant = min(1/((n+1-2/p)*phi),1)
+
+  # Method 5: oas_v
+  phi1 = (tr_s2-tr_sdiag2)/(tr_s2+tr_s^2-2*tr_sdiag2)
+  rou_oas_variant = min(1/((n+1)*phi1),1)
+  
+  # Method 8: Shafer(applied to correlation matrix)
+  v <- (1/(n*(n - 1))) * (crossprod(sample_sc^2) - (1/n) * (crossprod(sample_sc))^2)
+  diag(v) <- 0
+  d <- (scorr - diag(diag(scorr)))^2
+  rou_ss <- sum(v)/sum(d)
+  rou_ss <- max(min(rou_ss, 1), 0)
+  
+  # Method 9: Oracle_v
+  rou_o_variant = ((1/n)*tr_t2-(2/n)*tr_tdiag2+(1/n)*tr_t^2)/(((n+1)/n)*tr_t2+(1/n)*tr_t^2-((n+2)/n)*tr_tdiag2)
+  
+  # Method 9: Oracle_b
+    P = tr_tdiag2
+    R = tr_t2
+    Q = tr_t^2
+    
+    rou_b_o = (Q+R-2*P)/((n+1)*R+Q-(n+2)*P)
+    gamma_b_o = 1-(1/rou_b_o)*(((2/n)*P-(2/(n*p))*R)/(((n+2)/n)*P-(2/(n*p))*R-(1/p)*Q))
+    
+    # Method 10: oas_b
+    theta = rou_oas_variant
+    A = (tr_s^2)/p
+    B = tr_s2-tr_sdiag2
+    C = tr_sdiag2-A
+    
+    t1 = ((p-1)*C)/((p-1)*(A+C)-B)
+    t2 = (B-(p-1)*C)/((p-1)*(A+C)-B)
+    t3 = (n*p*C)/(2*(p-1)*(A+C)-2*B)
+    
+    if (abs(t3/((t1+t2)*theta+1-t1))<1){
+      gamma_oas = (theta-1)/(theta)
+    }else{
+      gamma_oas = (theta*(t3-t2)-1)/(theta*(t1+t3))
+    }
+    
+    # Method 11: oracle_v
+    rou_o_variant = ((1/n)*tr_t2-(2/n)*tr_tdiag2+(1/n)*tr_t^2)/(((n+1)/n)*tr_t2+(1/n)*tr_t^2-((n+2)/n)*tr_tdiag2)
+  
+    # Collect errors
+    err[1,'LW'] = rou_lw
+    err[1,'RBLW'] = rou_rblw
+    err[1,'SS'] = rou_ss
+    err[1,'OAS'] = rou_oas_constant
+    err[1,'OASD'] = rou_oas_variant
+    err[1,'OD'] = rou_o_variant
+    err[1,'OB'] = gamma_b_o
+    err[1,'OASB'] = gamma_oas
+  
+  return(err)
+  }
+  res_sample_size = map_dfr(seq(1,1000),sim_err) %>% mutate(n=n)
+}
+res_sample_size = map_dfr(seq(n_min, n_max,1),sim,.progress=TRUE)
+saveRDS(res_sample_size, 'coef_n*.rds')
+result = res_sample_size %>% group_by(n) %>% summarise(across(everything(), ~mean(.)))
+result = pivot_longer(result,cols=!n,names_to='method',values_to ='rho') %>% mutate(ours = ifelse(method %in% c('OASD','OASB'),TRUE,FALSE))
+pl = ggplot(result %>% filter(method != 's'), aes(x=n,y=rho,group=method,color=method, linetype=ours))+geom_line()+scale_linetype_manual(values = c("TRUE" = "solid", "FALSE" = "dashed")) + xlab(TeX(r'($n$)')) + ylab(TeX(r'($\rho$)'))+ guides(linetype = "none")
+ggsave('coef_n.jpg')
+ggplotly(pl)
+```
+
+
+```{r sample size incl. nl}
+small = 1
+large = 10
+r = 0.5
+
+corr = matrix(0, ncol=p, nrow=p)
+for (i in 1:p){
+  for (j in 1:p){
+    corr[i,j]=r^abs(i-j)
+  }
+}
+sd = diag(c(rep(small,p/2),rep(large,p/2)))
+cov = sd %*% corr %*% sd
+
+sim_diag <- function(n){
+    
+  sim_err <- function(iter){
+
+    err = data.frame(matrix(nrow=1,ncol=8))
+    colnames(err) = c('oas_v','oas_c', 'ss', 'rblw','lw','s','oracle_v','nl')
+    
+    # Generate samples from N(0,cov)
+    sample = mvrnorm(n, rep(0,p), cov)
+    
+    # Estimate the covariance matrix
+    scov = (t(sample) %*% sample)/nrow(sample)
+    f1 = (sum(diag(scov))/p)*diag(p)
+    f2 = diag(diag(scov))
+    tr_s = sum(diag(scov))
+    tr_s2 = sum(diag(t(scov) %*% scov))
+    tr_sdiag2 = sum(diag(diag(diag(scov)) %*% diag(diag(scov))))
+    
+    tr_t = sum(diag(cov))
+    tr_t2 = sum(diag(t(cov) %*% cov))
+    tr_tdiag2 = sum(diag(diag(diag(cov)) %*% diag(diag(cov))))
+    
+    scorr = cov2cor(scov)
+    tr_s_cor = sum(diag(scorr))
+    tr_s2_cor = sum(diag(t(scorr) %*% scorr))
+    f1_cor = (sum(diag(scorr))/p)*diag(p)
+    sample_sc = sample %*% (diag(diag(f2)^(-1/2)))
+    
+    # Method 2&3: LW & RBLW
+    num = 0
+    for (i in 1:n){
+      fill = sum((matrix(sample[i,],ncol=1) %*% matrix(sample[i,],nrow=1) - scov)^2)
+      num = num + fill
+    }
+    den = (n^2)*(tr_s2-(tr_s^2)/p)
+    rou_lw = num/den
+    rou_lw = min(rou_lw,1)
+    scov_lw = (1-rou_lw)*scov+rou_lw*f1
+
+    rou_rblw = (((n-2)/n)*tr_s2+tr_s^2)/((n+2)*(tr_s2-(tr_s^2)/p))
+    rou_rblw = min(rou_rblw,1)
+    scov_rblw = (1-rou_rblw)*scov+rou_rblw*f1
+    
+    # Method 4: oas_c
+    phi = (tr_s2-(tr_s^2)/p)/(tr_s^2+(1-2/p)*tr_s2)
+    rou_oas_constant = min(1/((n+1-2/p)*phi),1)
+    scov_oas_constant = (1-rou_oas_constant)*scov+rou_oas_constant*f1
+
+    # Method 5: oas_v
+    phi1 = (tr_s2-tr_sdiag2)/(tr_s2+tr_s^2-2*tr_sdiag2)
+    rou_oas_variant = min(1/((n+1)*phi1),1)
+    scov_oas_variant = (1-rou_oas_variant)*scov+rou_oas_variant*f2
+    
+    # Method 8: Shafer(applied to correlation matrix)
+    v <- (1/(n*(n - 1))) * (crossprod(sample_sc^2) - (1/n) * (crossprod(sample_sc))^2)
+    diag(v) <- 0
+    d <- (scorr - diag(diag(scorr)))^2
+    rou_ss <- sum(v)/sum(d)
+    rou_ss <- max(min(rou_ss, 1), 0)
+    scorr_ss = (1-rou_ss)*scorr+rou_ss*f1_cor
+    scov_ss = (f2^(1/2)) %*% scorr_ss %*% (f2^(1/2))
+    
+    # Method 9: Oracle_v
+    rou_o_variant = ((1/n)*tr_t2-(2/n)*tr_tdiag2+(1/n)*tr_t^2)/(((n+1)/n)*tr_t2+(1/n)*tr_t^2-((n+2)/n)*tr_tdiag2)
+    scov_o_variant = (1-rou_o_variant)*scov+rou_o_variant*f2
+    
+    # Method 10: NL
+    scov_nl = nlshrink_cov(sample,k=1)
+    
+    # Collect errors
+    err[1,'lw'] = get_err(scov_lw,cov)
+    err[1,'rblw'] = get_err(scov_rblw,cov)
+    err[1,'ss'] = get_err(scov_ss,cov)
+    err[1,'oas_c'] = get_err(scov_oas_constant,cov)
+    err[1,'oas_v'] = get_err(scov_oas_variant,cov)
+    err[1,'s']=sum((scov-cov)^2)
+    err[1,'oracle_v'] = get_err(scov_o_variant,cov)
+    err[1,'nl'] = get_err(scov_nl,cov)
+    
+    return(err)
+  }
+  res = map_dfr(seq(1,1000), sim_err) %>% mutate(n=n)
+}
+res_sample_size = map_dfr(c(6,7,22:30),sim_diag,.progress=TRUE)
+saveRDS(res_sample_size, 'n_wnl.rds')
+result = res_sample_size %>% group_by(n) %>% summarise(across(everything(), ~mean(.))) %>% ungroup() %>% mutate(across(-c(s,n), ~(.data$s-.)/.data$s))
+result = pivot_longer(result,cols=!n,names_to='method',values_to ='PRIAL')%>% mutate(ours = ifelse(method=='oas_v',TRUE,FALSE))
+pl = ggplot(result %>% filter(method != 's'), aes(x=n,y=PRIAL,group=method,color=method, linetype=ours))+geom_line()+scale_linetype_manual(values = c("TRUE" = "solid", "FALSE" = "dashed")) + xlab(TeX(r'($n$)')) + guides(linetype = "none")
+ggplotly(pl)
+ggsave('n_wnl.jpg')
+```
+
+
+```{r sample size include nl (updated)}
+small = 1
+large = 10
+r = 0.5
+
+corr = matrix(0, ncol=p, nrow=p)
+for (i in 1:p){
+  for (j in 1:p){
+    corr[i,j]=r^abs(i-j)
+  }
+}
+sd = diag(c(rep(small,p/2),rep(large,p/2)))
+cov = sd %*% corr %*% sd
+
+sim_diag <- function(n){
+    
+  sim_err <- function(iter){
+
+    err = data.frame(matrix(nrow=1,ncol=10))
+    colnames(err) = c('OASD','OAS', 'SS', 'RBLW','LW','s','OD','OB','OASB','NL')
+    
+    # Generate samples from N(0,cov)
+    sample = mvrnorm(n, rep(0,p), cov)
+    
+    # Estimate the covariance matrix
+    scov = (t(sample) %*% sample)/nrow(sample)
+    f1 = (sum(diag(scov))/p)*diag(p)
+    f2 = diag(diag(scov))
+    tr_s = sum(diag(scov))
+    tr_s2 = sum(diag(t(scov) %*% scov))
+    tr_sdiag2 = sum(diag(diag(diag(scov)) %*% diag(diag(scov))))
+    
+    tr_t = sum(diag(cov))
+    tr_t2 = sum(diag(t(cov) %*% cov))
+    tr_tdiag2 = sum(diag(diag(diag(cov)) %*% diag(diag(cov))))
+    
+    scorr = cov2cor(scov)
+    tr_s_cor = sum(diag(scorr))
+    tr_s2_cor = sum(diag(t(scorr) %*% scorr))
+    f1_cor = (sum(diag(scorr))/p)*diag(p)
+    sample_sc = sample %*% (diag(diag(f2)^(-1/2)))
+    
+    # Method 2&3: LW & RBLW
+    num = 0
+    for (i in 1:n){
+      fill = sum((matrix(sample[i,],ncol=1) %*% matrix(sample[i,],nrow=1) - scov)^2)
+      num = num + fill
+    }
+    den = (n^2)*(tr_s2-(tr_s^2)/p)
+    rou_lw = num/den
+    rou_lw = min(rou_lw,1)
+    scov_lw = (1-rou_lw)*scov+rou_lw*f1
+
+    rou_rblw = (((n-2)/n)*tr_s2+tr_s^2)/((n+2)*(tr_s2-(tr_s^2)/p))
+    rou_rblw = min(rou_rblw,1)
+    scov_rblw = (1-rou_rblw)*scov+rou_rblw*f1
+    
+    # Method 4: oas_c
+    phi = (tr_s2-(tr_s^2)/p)/(tr_s^2+(1-2/p)*tr_s2)
+    rou_oas_constant = min(1/((n+1-2/p)*phi),1)
+    scov_oas_constant = (1-rou_oas_constant)*scov+rou_oas_constant*f1
+
+    # Method 5: oas_v
+    phi1 = (tr_s2-tr_sdiag2)/(tr_s2+tr_s^2-2*tr_sdiag2)
+    rou_oas_variant = min(1/((n+1)*phi1),1)
+    scov_oas_variant = (1-rou_oas_variant)*scov+rou_oas_variant*f2
+    
+    # Method 8: Shafer(applied to correlation matrix)
+    v <- (1/(n*(n - 1))) * (crossprod(sample_sc^2) - (1/n) * (crossprod(sample_sc))^2)
+    diag(v) <- 0
+    d <- (scorr - diag(diag(scorr)))^2
+    rou_ss <- sum(v)/sum(d)
+    rou_ss <- max(min(rou_ss, 1), 0)
+    scorr_ss = (1-rou_ss)*scorr+rou_ss*f1_cor
+    scov_ss = (f2^(1/2)) %*% scorr_ss %*% (f2^(1/2))
+    
+    # Method 9: Oracle_v
+    rou_o_variant = ((1/n)*tr_t2-(2/n)*tr_tdiag2+(1/n)*tr_t^2)/(((n+1)/n)*tr_t2+(1/n)*tr_t^2-((n+2)/n)*tr_tdiag2)
+    scov_o_variant = (1-rou_o_variant)*scov+rou_o_variant*f2
+    
+    # Method 9: Oracle_b
+    P = tr_tdiag2
+    R = tr_t2
+    Q = tr_t^2
+    
+    rou_b_o = (Q+R-2*P)/((n+1)*R+Q-(n+2)*P)
+    gamma_b_o = 1-(1/rou_b_o)*(((2/n)*P-(2/(n*p))*R)/(((n+2)/n)*P-(2/(n*p))*R-(1/p)*Q))
+    
+    scov_o_both = (1-rou_b_o)*scov+rou_b_o*(gamma_b_o*f2+(1-gamma_b_o)*f1)
+    
+    # Method 10: oas_b
+    theta = rou_oas_variant
+    A = (tr_s^2)/p
+    B = tr_s2-tr_sdiag2
+    C = tr_sdiag2-A
+    
+    t1 = ((p-1)*C)/((p-1)*(A+C)-B)
+    t2 = (B-(p-1)*C)/((p-1)*(A+C)-B)
+    t3 = (n*p*C)/(2*(p-1)*(A+C)-2*B)
+    
+    if (abs(t3/((t1+t2)*theta+1-t1))<1){
+      gamma_oas = (theta-1)/(theta)
+    }else{
+      gamma_oas = (theta*(t3-t2)-1)/(theta*(t1+t3))
+    }
+    
+    scov_oas_both = (1-theta)*scov+theta*(gamma_oas*f2+(1-gamma_oas)*f1)
+    
+    # Method 11: NL
+    scov_nl = nlshrink_cov(sample,k=1)
+    
+    # Collect errors
+    err[1,'LW'] = get_err(scov_lw,cov)
+    err[1,'RBLW'] = get_err(scov_rblw,cov)
+    err[1,'SS'] = get_err(scov_ss,cov)
+    err[1,'OAS'] = get_err(scov_oas_constant,cov)
+    err[1,'OASD'] = get_err(scov_oas_variant,cov)
+    err[1,'s']=sum((scov-cov)^2)
+    err[1,'OD'] = get_err(scov_o_variant,cov)
+    err[1,'OB'] = get_err(scov_o_both,cov)
+    err[1,'OASB'] = get_err(scov_oas_both,cov)
+    err[1,'NL'] = get_err(scov_nl,cov)
+    
+    return(err)
+  }
+  res = map_dfr(seq(1,1000), sim_err) %>% mutate(n=n)
+  print(n)
+}
+res_sample_size = map_dfr(seq(n_min, n_max, 1),sim_diag,.progress=TRUE)
+# saveRDS(res_sample_size, 'n.rds')
+# result = res_sample_size %>% group_by(n) %>% summarise(across(everything(), ~mean(.))) %>% ungroup() %>% mutate(across(-c(s,n), ~(.data$s-.)/.data$s)*100)
+# result = pivot_longer(result,cols=!n,names_to='method',values_to ='PRIAL')%>% mutate(ours = ifelse(method %in% c('OASD','OASB'),TRUE,FALSE))
+# pl = ggplot(result %>% filter(method != 's'), aes(x=n,y=PRIAL,group=method,color=method, linetype=ours))+geom_line()+scale_linetype_manual(values = c("TRUE" = "solid", "FALSE" = "dashed")) + xlab(TeX(r'($n$)')) + guides(linetype = "none")
+# ggplotly(pl)
+# ggsave('n.jpg')
+```
+
+
+
+```{r corr diagonal}
+r = 0.5
+n = 18
+corr = matrix(0, ncol=p, nrow=p)
+for (i in 1:p){
+  for (j in 1:p){
+    corr[i,j]=r^abs(i-j)
+  }
+}
+
+sim_diag <- function(large){
+  
+  sd = diag(c(rep(small,p/2),rep(large,p/2)))
+  cov = sd %*% corr %*% sd
+    
+  sim_err <- function(iter){
+
+    err = data.frame(matrix(nrow=1,ncol=10))
+    colnames(err) = c('OASD','OAS', 'SS', 'RBLW','LW','s','OD','OB','OASB','Oracle')
+    
+    # Generate samples from N(0,cov)
+    sample = mvrnorm(n, rep(0,p), cov)
+    
+    # Estimate the covariance matrix
+    scov = (t(sample) %*% sample)/nrow(sample)
+    f1 = (sum(diag(scov))/p)*diag(p)
+    f2 = diag(diag(scov))
+    tr_s = sum(diag(scov))
+    tr_s2 = sum(diag(t(scov) %*% scov))
+    tr_sdiag2 = sum(diag(diag(diag(scov)) %*% diag(diag(scov))))
+    
+    tr_t = sum(diag(cov))
+    tr_t2 = sum(diag(t(cov) %*% cov))
+    tr_tdiag2 = sum(diag(diag(diag(cov)) %*% diag(diag(cov))))
+    
+    scorr = cov2cor(scov)
+    tr_s_cor = sum(diag(scorr))
+    tr_s2_cor = sum(diag(t(scorr) %*% scorr))
+    f1_cor = (sum(diag(scorr))/p)*diag(p)
+    sample_sc = sample %*% (diag(diag(f2)^(-1/2)))
+    
+    # Method 2&3: LW & RBLW
+    num = 0
+    for (i in 1:n){
+      fill = sum((matrix(sample_sc[i,],ncol=1) %*% matrix(sample_sc[i,],nrow=1) - scorr)^2)
+      num = num + fill
+    }
+    den = (n^2)*(tr_s2_cor-(tr_s_cor^2)/p)
+    rou_lw = num/den
+    rou_lw = min(rou_lw,1)
+    scorr_lw = (1-rou_lw)*scorr+rou_lw*f1_cor
+    scov_lw = (f2^(1/2)) %*% scorr_lw %*% (f2^(1/2))
+
+    rou_rblw = (((n-2)/n)*tr_s2_cor+tr_s_cor^2)/((n+2)*(tr_s2_cor-(tr_s_cor^2)/p))
+    rou_rblw = min(rou_rblw,1)
+    scorr_rblw = (1-rou_rblw)*scorr+rou_rblw*f1_cor
+    scov_rblw = (f2^(1/2)) %*% scorr_rblw %*% (f2^(1/2))
+    
+    # Method 4: oas_c
+    phi = (tr_s2_cor-(tr_s_cor^2)/p)/(tr_s_cor^2+(1-2/p)*tr_s2_cor)
+    rou_oas_constant = min(1/((n+1-2/p)*phi),1)
+    scorr_oas_constant = (1-rou_oas_constant)*scorr+rou_oas_constant*f1_cor
+    scov_oas_constant = (f2^(1/2)) %*% scorr_oas_constant %*% (f2^(1/2))
+
+    # Method 5: oas_v
+    phi1 = (tr_s2-tr_sdiag2)/(tr_s2+tr_s^2-2*tr_sdiag2)
+    rou_oas_variant = min(1/((n+1)*phi1),1)
+    scov_oas_variant = (1-rou_oas_variant)*scov+rou_oas_variant*f2
+    
+    # Method 8: Shafer(applied to correlation matrix)
+    v <- (1/(n*(n - 1))) * (crossprod(sample_sc^2) - (1/n) * (crossprod(sample_sc))^2)
+    diag(v) <- 0
+    d <- (scorr - diag(diag(scorr)))^2
+    rou_ss <- sum(v)/sum(d)
+    rou_ss <- max(min(rou_ss, 1), 0)
+    scorr_ss = (1-rou_ss)*scorr+rou_ss*f1_cor
+    scov_ss = (f2^(1/2)) %*% scorr_ss %*% (f2^(1/2))
+    
+    # Method 9: Oracle_v
+    rou_o_variant = ((1/n)*tr_t2-(2/n)*tr_tdiag2+(1/n)*tr_t^2)/(((n+1)/n)*tr_t2+(1/n)*tr_t^2-((n+2)/n)*tr_tdiag2)
+    scov_o_variant = (1-rou_o_variant)*scov+rou_o_variant*f2
+    
+    # Method 9: Oracle_b
+    P = tr_tdiag2
+    R = tr_t2
+    Q = tr_t^2
+    
+    rou_b_o = (Q+R-2*P)/((n+1)*R+Q-(n+2)*P)
+    gamma_b_o = 1-(1/rou_b_o)*(((2/n)*P-(2/(n*p))*R)/(((n+2)/n)*P-(2/(n*p))*R-(1/p)*Q))
+    
+    scov_o_both = (1-rou_b_o)*scov+rou_b_o*(gamma_b_o*f2+(1-gamma_b_o)*f1)
+    
+    # Method 10: oas_b
+    theta = rou_oas_variant
+    A = (tr_s^2)/p
+    B = tr_s2-tr_sdiag2
+    C = tr_sdiag2-A
+    
+    t1 = ((p-1)*C)/((p-1)*(A+C)-B)
+    t2 = (B-(p-1)*C)/((p-1)*(A+C)-B)
+    t3 = (n*p*C)/(2*(p-1)*(A+C)-2*B)
+    
+    if (abs(t3/((t1+t2)*theta+1-t1))<1){
+      gamma_oas = (theta-1)/(theta)
+    }else{
+      gamma_oas = (theta*(t3-t2)-1)/(theta*(t1+t3))
+    }
+    
+    scov_oas_both = (1-theta)*scov+theta*(gamma_oas*f2+(1-gamma_oas)*f1)
+    
+    # Method 12: sample analogue
+    rou_od = ((1/n)*tr_s2-(2/n)*tr_sdiag2+(1/n)*tr_s^2)/(((n+1)/n)*tr_s2+(1/n)*tr_s^2-((n+2)/n)*tr_sdiag2)
+    scov_od = (1-rou_od)*scov+rou_od*f2
+    
+    
+    # Collect errors
+    err[1,'LW'] = get_err(scov_lw,cov)
+    err[1,'RBLW'] = get_err(scov_rblw,cov)
+    err[1,'SS'] = get_err(scov_ss,cov)
+    err[1,'OAS'] = get_err(scov_oas_constant,cov)
+    err[1,'OASD'] = get_err(scov_oas_variant,cov)
+    err[1,'s']=sum((scov-cov)^2)
+    err[1,'Oracle'] = get_err(scov_o_variant,cov)
+    err[1,'OB'] = get_err(scov_o_both,cov)
+    err[1,'OASB'] = get_err(scov_oas_both,cov)
+    err[1,'OD'] = get_err(scov_od,cov)
+    
+    return(err)
+  }
+  res = map_dfr(seq(1,5000), sim_err) %>% mutate(large = large)
+}
+res_sample_size = map_dfr(seq(large_min, large_max, 1),sim_diag,.progress=TRUE)
+saveRDS(res_sample_size, 'diag_corr_5000.rds')
+# res_sample_size = readRDS('diag_corr.rds')
+result = res_sample_size %>% group_by(large) %>% summarise(across(everything(), ~mean(.))) %>% ungroup() %>% mutate(across(-c(s,large), ~(.data$s-.)/.data$s)*100)
+# result_mean = res_sample_size %>% group_by(large) %>% summarise(across(everything(), ~mean(.))) %>% ungroup()
+# colnames(result_mean) = c('large',paste("mean", colnames(result_mean[,2:length(result_mean)]), sep = "_"))
+# result_sd = res_sample_size %>% group_by(large) %>% summarise(across(everything(), ~sd(.))) %>% ungroup()
+# colnames(result_sd) = paste("sd", colnames(result_sd), sep = "_")
+# result_tot = cbind(result_mean, result_sd[,2:ncol(result_sd)]) %>% 
+#   mutate(OASD_max = mean_OASD+1.96*(sd_OASD/sqrt(1000)),
+#          OAS_min = mean_OAS-1.96*(sd_OAS/sqrt(1000)),
+#          SS_min = mean_SS-1.96*(sd_SS/sqrt(1000)),
+#          RBLW_min = mean_RBLW-1.96*(sd_RBLW/sqrt(1000)),
+#          LW_min = mean_LW-1.96*(sd_LW/sqrt(1000)),
+#          s_min = mean_s-1.96*(sd_s/sqrt(1000)),
+#          OD_min = mean_OD-1.96*(sd_OD/sqrt(1000)),
+#          OB_min = mean_OB-1.96*(sd_OB/sqrt(1000)),
+#          OASB_min = mean_OASB-1.96*(sd_OASB/sqrt(1000)),
+#          Oracle_max = mean_Oracle+1.96*(sd_Oracle/sqrt(1000)))
+# result_filtered = result_tot %>% select(large, OASD_max, OAS_min, SS_min, RBLW_min, LW_min, s_min,OD_min,OB_min,OASB_min, Oracle_max) %>% mutate(across(-c(s_min,large), ~(.data$s_min-.)/.data$s_min)*100)
+# 
+result = pivot_longer(result,cols=!large,names_to='method',values_to ='PRIAL')%>% mutate(ours = ifelse(method=='OASD',TRUE,FALSE))
+pl = ggplot(result %>% filter(!method %in% c('s', 'RBLW','OB','OASB','OD')), aes(x=large,y=PRIAL,group=method,color=method, linetype=ours))+geom_line()+scale_linetype_manual(values = c("TRUE" = "solid", "FALSE" = "dashed")) + xlab(TeX(r'($sd$)')) + guides(linetype = "none") + theme(
+  text = element_text(size = 12),              # Global text size
+  axis.title = element_text(size = 12),         # Axis titles
+  axis.text = element_text(size = 12),          # Axis text
+  plot.title = element_text(size = 12),         # Plot title
+  legend.title = element_text(size = 12),       # Legend title
+  legend.text = element_text(size = 12),         # Legend text
+  legend.position = "bottom"
+)
+# pl
+# ggsave('diag_corr.jpg', width = 6, height = 4)
+```
+
+```{r corr offdiag sparsity}
+large = 10
+n = 18
+
+sim_diag <- function(r){
+  
+  corr = matrix(0, ncol=p, nrow=p)
+  for (i in 1:p){
+    for (j in 1:p){
+      corr[i,j]=r^abs(i-j)
+    }
+  }
+  
+  sd = diag(c(rep(small,p/2),rep(large,p/2)))
+  cov = sd %*% corr %*% sd
+    
+  sim_err <- function(iter){
+
+    err = data.frame(matrix(nrow=1,ncol=10))
+    colnames(err) = c('OASD','OAS', 'SS', 'RBLW','LW','s','OD','OB','OASB','Oracle')
+    
+    # Generate samples from N(0,cov)
+    sample = mvrnorm(n, rep(0,p), cov)
+    
+    # Estimate the covariance matrix
+    scov = (t(sample) %*% sample)/nrow(sample)
+    f1 = (sum(diag(scov))/p)*diag(p)
+    f2 = diag(diag(scov))
+    tr_s = sum(diag(scov))
+    tr_s2 = sum(diag(t(scov) %*% scov))
+    tr_sdiag2 = sum(diag(diag(diag(scov)) %*% diag(diag(scov))))
+    
+    tr_t = sum(diag(cov))
+    tr_t2 = sum(diag(t(cov) %*% cov))
+    tr_tdiag2 = sum(diag(diag(diag(cov)) %*% diag(diag(cov))))
+    
+    scorr = cov2cor(scov)
+    tr_s_cor = sum(diag(scorr))
+    tr_s2_cor = sum(diag(t(scorr) %*% scorr))
+    f1_cor = (sum(diag(scorr))/p)*diag(p)
+    sample_sc = sample %*% (diag(diag(f2)^(-1/2)))
+    
+    # Method 2&3: LW & RBLW
+    num = 0
+    for (i in 1:n){
+      fill = sum((matrix(sample_sc[i,],ncol=1) %*% matrix(sample_sc[i,],nrow=1) - scorr)^2)
+      num = num + fill
+    }
+    den = (n^2)*(tr_s2_cor-(tr_s_cor^2)/p)
+    rou_lw = num/den
+    rou_lw = min(rou_lw,1)
+    scorr_lw = (1-rou_lw)*scorr+rou_lw*f1_cor
+    scov_lw = (f2^(1/2)) %*% scorr_lw %*% (f2^(1/2))
+
+    rou_rblw = (((n-2)/n)*tr_s2_cor+tr_s_cor^2)/((n+2)*(tr_s2_cor-(tr_s_cor^2)/p))
+    rou_rblw = min(rou_rblw,1)
+    scorr_rblw = (1-rou_rblw)*scorr+rou_rblw*f1_cor
+    scov_rblw = (f2^(1/2)) %*% scorr_rblw %*% (f2^(1/2))
+    
+    # Method 4: oas_c
+    phi = (tr_s2_cor-(tr_s_cor^2)/p)/(tr_s_cor^2+(1-2/p)*tr_s2_cor)
+    rou_oas_constant = min(1/((n+1-2/p)*phi),1)
+    scorr_oas_constant = (1-rou_oas_constant)*scorr+rou_oas_constant*f1_cor
+    scov_oas_constant = (f2^(1/2)) %*% scorr_oas_constant %*% (f2^(1/2))
+
+    # Method 5: oas_v
+    phi1 = (tr_s2-tr_sdiag2)/(tr_s2+tr_s^2-2*tr_sdiag2)
+    rou_oas_variant = min(1/((n+1)*phi1),1)
+    scov_oas_variant = (1-rou_oas_variant)*scov+rou_oas_variant*f2
+    
+    # Method 8: Shafer(applied to correlation matrix)
+    v <- (1/(n*(n - 1))) * (crossprod(sample_sc^2) - (1/n) * (crossprod(sample_sc))^2)
+    diag(v) <- 0
+    d <- (scorr - diag(diag(scorr)))^2
+    rou_ss <- sum(v)/sum(d)
+    rou_ss <- max(min(rou_ss, 1), 0)
+    scorr_ss = (1-rou_ss)*scorr+rou_ss*f1_cor
+    scov_ss = (f2^(1/2)) %*% scorr_ss %*% (f2^(1/2))
+    
+    # Method 9: Oracle_v
+    rou_o_variant = ((1/n)*tr_t2-(2/n)*tr_tdiag2+(1/n)*tr_t^2)/(((n+1)/n)*tr_t2+(1/n)*tr_t^2-((n+2)/n)*tr_tdiag2)
+    scov_o_variant = (1-rou_o_variant)*scov+rou_o_variant*f2
+    
+    # Method 9: Oracle_b
+    P = tr_tdiag2
+    R = tr_t2
+    Q = tr_t^2
+    
+    rou_b_o = (Q+R-2*P)/((n+1)*R+Q-(n+2)*P)
+    gamma_b_o = 1-(1/rou_b_o)*(((2/n)*P-(2/(n*p))*R)/(((n+2)/n)*P-(2/(n*p))*R-(1/p)*Q))
+    
+    scov_o_both = (1-rou_b_o)*scov+rou_b_o*(gamma_b_o*f2+(1-gamma_b_o)*f1)
+    
+    # Method 10: oas_b
+    theta = rou_oas_variant
+    A = (tr_s^2)/p
+    B = tr_s2-tr_sdiag2
+    C = tr_sdiag2-A
+    
+    t1 = ((p-1)*C)/((p-1)*(A+C)-B)
+    t2 = (B-(p-1)*C)/((p-1)*(A+C)-B)
+    t3 = (n*p*C)/(2*(p-1)*(A+C)-2*B)
+    
+    if (abs(t3/((t1+t2)*theta+1-t1))<1){
+      gamma_oas = (theta-1)/(theta)
+    }else{
+      gamma_oas = (theta*(t3-t2)-1)/(theta*(t1+t3))
+    }
+    
+    scov_oas_both = (1-theta)*scov+theta*(gamma_oas*f2+(1-gamma_oas)*f1)
+    
+     # Method 12: sample analogue
+    rou_od = ((1/n)*tr_s2-(2/n)*tr_sdiag2+(1/n)*tr_s^2)/(((n+1)/n)*tr_s2+(1/n)*tr_s^2-((n+2)/n)*tr_sdiag2)
+    scov_od = (1-rou_od)*scov+rou_od*f2
+    
+    
+    # Collect errors
+    err[1,'LW'] = get_err(scov_lw,cov)
+    err[1,'RBLW'] = get_err(scov_rblw,cov)
+    err[1,'SS'] = get_err(scov_ss,cov)
+    err[1,'OAS'] = get_err(scov_oas_constant,cov)
+    err[1,'OASD'] = get_err(scov_oas_variant,cov)
+    err[1,'s']=sum((scov-cov)^2)
+    err[1,'Oracle'] = get_err(scov_o_variant,cov)
+    err[1,'OB'] = get_err(scov_o_both,cov)
+    err[1,'OASB'] = get_err(scov_oas_both,cov)
+    err[1,'OD'] = get_err(scov_od,cov)
+    
+    return(err)
+  }
+  res = map_dfr(seq(1,5000), sim_err) %>% mutate(r=r)
+}
+res_sample_size = map_dfr(seq(r_min, r_max, 0.1),sim_diag,.progress=TRUE)
+saveRDS(res_sample_size, 'r_corr.rds')
+# res_sample_size = readRDS('r_corr.rds')
+# result_mean = res_sample_size %>% group_by(r) %>% summarise(across(everything(), ~mean(.))) %>% ungroup()
+# colnames(result_mean) = c('r',paste("mean", colnames(result_mean[,2:length(result_mean)]), sep = "_"))
+# result_sd = res_sample_size %>% group_by(r) %>% summarise(across(everything(), ~sd(.))) %>% ungroup()
+# colnames(result_sd) = paste("sd", colnames(result_sd), sep = "_")
+# result_tot = cbind(result_mean, result_sd[,2:ncol(result_sd)]) %>% 
+#   mutate(OASD_max = mean_OASD+1.96*(sd_OASD/sqrt(1000)),
+#          OAS_min = mean_OAS-1.96*(sd_OAS/sqrt(1000)),
+#          SS_min = mean_SS-1.96*(sd_SS/sqrt(1000)),
+#          RBLW_min = mean_RBLW-1.96*(sd_RBLW/sqrt(1000)),
+#          LW_min = mean_LW-1.96*(sd_LW/sqrt(1000)),
+#          s_min = mean_s-1.96*(sd_s/sqrt(1000)),
+#          OD_min = mean_OD-1.96*(sd_OD/sqrt(1000)),
+#          OB_min = mean_OB-1.96*(sd_OB/sqrt(1000)),
+#          OASB_min = mean_OASB-1.96*(sd_OASB/sqrt(1000)),
+#          Oracle_max = mean_Oracle+1.96*(sd_Oracle/sqrt(1000)))
+# result_filtered = result_tot %>% select(r, OASD_max, OAS_min, SS_min, RBLW_min, LW_min, s_min,OD_min,OB_min,OASB_min, Oracle_max) %>% mutate(across(-c(s_min,r), ~(.data$s_min-.)/.data$s_min)*100)
+# 
+# result_filtered = pivot_longer(result_filtered,cols=!r,names_to='method',values_to ='PRIAL')%>% mutate(ours = ifelse(method=='OASD',TRUE,FALSE))
+# # result = res_sample_size %>% group_by(r) %>% summarise(across(everything(), ~mean(.))) %>% ungroup() %>% mutate(across(-c(s,r), ~(.data$s-.)/.data$s)*100)
+# # result = pivot_longer(result,cols=!r,names_to='method',values_to ='PRIAL')%>% mutate(ours = ifelse(method=='OASD',TRUE,FALSE))
+# pl = ggplot(result_filtered %>% filter(!method %in% c('s_min', 'RBLW_min','OB_min','OASB_min','OD_min')), aes(x=r,y=PRIAL,group=method,color=method, linetype=ours))+geom_line()+scale_linetype_manual(values = c("TRUE" = "solid", "FALSE" = "dashed")) + xlab(TeX(r'($r$)')) + guides(linetype = "none") + theme(
+# #   text = element_text(size = 12),              # Global text size
+# #   axis.title = element_text(size = 12),         # Axis titles
+# #   axis.text = element_text(size = 12),          # Axis text
+# #   plot.title = element_text(size = 12),         # Plot title
+# #   legend.title = element_text(size = 12),       # Legend title
+# #   legend.text = element_text(size = 12),         # Legend text
+# #   legend.position = "bottom"
+# # )
+# # pl
+# # ggsave('r_corr.jpg', width = 6, height = 4)
+```
+
+```{r corr sample size}
+small = 1
+large = 10
+r = 0.5
+
+corr = matrix(0, ncol=p, nrow=p)
+for (i in 1:p){
+  for (j in 1:p){
+    corr[i,j]=r^abs(i-j)
+  }
+}
+sd = diag(c(rep(small,p/2),rep(large,p/2)))
+cov = sd %*% corr %*% sd
+
+sim_diag <- function(n){
+    
+  sim_err <- function(iter){
+
+    err = data.frame(matrix(nrow=1,ncol=10))
+    colnames(err) = c('OASD','OAS', 'SS', 'RBLW','LW','s','OD','OB','OASB','Oracle')
+    
+    # Generate samples from N(0,cov)
+    sample = mvrnorm(n, rep(0,p), cov)
+    
+    # Estimate the covariance matrix
+    scov = (t(sample) %*% sample)/nrow(sample)
+    f1 = (sum(diag(scov))/p)*diag(p)
+    f2 = diag(diag(scov))
+    tr_s = sum(diag(scov))
+    tr_s2 = sum(diag(t(scov) %*% scov))
+    tr_sdiag2 = sum(diag(diag(diag(scov)) %*% diag(diag(scov))))
+    
+    tr_t = sum(diag(cov))
+    tr_t2 = sum(diag(t(cov) %*% cov))
+    tr_tdiag2 = sum(diag(diag(diag(cov)) %*% diag(diag(cov))))
+    
+    scorr = cov2cor(scov)
+    tr_s_cor = sum(diag(scorr))
+    tr_s2_cor = sum(diag(t(scorr) %*% scorr))
+    f1_cor = (sum(diag(scorr))/p)*diag(p)
+    sample_sc = sample %*% (diag(diag(f2)^(-1/2)))
+    
+    # Method 2&3: LW & RBLW
+    num = 0
+    for (i in 1:n){
+      fill = sum((matrix(sample_sc[i,],ncol=1) %*% matrix(sample_sc[i,],nrow=1) - scorr)^2)
+      num = num + fill
+    }
+    den = (n^2)*(tr_s2_cor-(tr_s_cor^2)/p)
+    rou_lw = num/den
+    rou_lw = min(rou_lw,1)
+    scorr_lw = (1-rou_lw)*scorr+rou_lw*f1_cor
+    scov_lw = (f2^(1/2)) %*% scorr_lw %*% (f2^(1/2))
+
+    rou_rblw = (((n-2)/n)*tr_s2_cor+tr_s_cor^2)/((n+2)*(tr_s2_cor-(tr_s_cor^2)/p))
+    rou_rblw = min(rou_rblw,1)
+    scorr_rblw = (1-rou_rblw)*scorr+rou_rblw*f1_cor
+    scov_rblw = (f2^(1/2)) %*% scorr_rblw %*% (f2^(1/2))
+    
+    # Method 4: oas_c
+    phi = (tr_s2_cor-(tr_s_cor^2)/p)/(tr_s_cor^2+(1-2/p)*tr_s2_cor)
+    rou_oas_constant = min(1/((n+1-2/p)*phi),1)
+    scorr_oas_constant = (1-rou_oas_constant)*scorr+rou_oas_constant*f1_cor
+    scov_oas_constant = (f2^(1/2)) %*% scorr_oas_constant %*% (f2^(1/2))
+
+    # Method 5: oas_v
+    phi1 = (tr_s2-tr_sdiag2)/(tr_s2+tr_s^2-2*tr_sdiag2)
+    rou_oas_variant = min(1/((n+1)*phi1),1)
+    scov_oas_variant = (1-rou_oas_variant)*scov+rou_oas_variant*f2
+    
+    # Method 8: Shafer(applied to correlation matrix)
+    v <- (1/(n*(n - 1))) * (crossprod(sample_sc^2) - (1/n) * (crossprod(sample_sc))^2)
+    diag(v) <- 0
+    d <- (scorr - diag(diag(scorr)))^2
+    rou_ss <- sum(v)/sum(d)
+    rou_ss <- max(min(rou_ss, 1), 0)
+    scorr_ss = (1-rou_ss)*scorr+rou_ss*f1_cor
+    scov_ss = (f2^(1/2)) %*% scorr_ss %*% (f2^(1/2))
+    
+    # Method 9: Oracle_v
+    rou_o_variant = ((1/n)*tr_t2-(2/n)*tr_tdiag2+(1/n)*tr_t^2)/(((n+1)/n)*tr_t2+(1/n)*tr_t^2-((n+2)/n)*tr_tdiag2)
+    scov_o_variant = (1-rou_o_variant)*scov+rou_o_variant*f2
+    
+    # Method 9: Oracle_b
+    P = tr_tdiag2
+    R = tr_t2
+    Q = tr_t^2
+    
+    rou_b_o = (Q+R-2*P)/((n+1)*R+Q-(n+2)*P)
+    gamma_b_o = 1-(1/rou_b_o)*(((2/n)*P-(2/(n*p))*R)/(((n+2)/n)*P-(2/(n*p))*R-(1/p)*Q))
+    
+    scov_o_both = (1-rou_b_o)*scov+rou_b_o*(gamma_b_o*f2+(1-gamma_b_o)*f1)
+    
+    # Method 10: oas_b
+    theta = rou_oas_variant
+    A = (tr_s^2)/p
+    B = tr_s2-tr_sdiag2
+    C = tr_sdiag2-A
+    
+    t1 = ((p-1)*C)/((p-1)*(A+C)-B)
+    t2 = (B-(p-1)*C)/((p-1)*(A+C)-B)
+    t3 = (n*p*C)/(2*(p-1)*(A+C)-2*B)
+    
+    if (abs(t3/((t1+t2)*theta+1-t1))<1){
+      gamma_oas = (theta-1)/(theta)
+    }else{
+      gamma_oas = (theta*(t3-t2)-1)/(theta*(t1+t3))
+    }
+    
+    scov_oas_both = (1-theta)*scov+theta*(gamma_oas*f2+(1-gamma_oas)*f1)
+    
+     # Method 12: sample analogue
+    rou_od = ((1/n)*tr_s2-(2/n)*tr_sdiag2+(1/n)*tr_s^2)/(((n+1)/n)*tr_s2+(1/n)*tr_s^2-((n+2)/n)*tr_sdiag2)
+    scov_od = (1-rou_od)*scov+rou_od*f2
+    
+    
+    # Collect errors
+    err[1,'LW'] = get_err(scov_lw,cov)
+    err[1,'RBLW'] = get_err(scov_rblw,cov)
+    err[1,'SS'] = get_err(scov_ss,cov)
+    err[1,'OAS'] = get_err(scov_oas_constant,cov)
+    err[1,'OASD'] = get_err(scov_oas_variant,cov)
+    err[1,'s']=sum((scov-cov)^2)
+    err[1,'Oracle'] = get_err(scov_o_variant,cov)
+    err[1,'OB'] = get_err(scov_o_both,cov)
+    err[1,'OASB'] = get_err(scov_oas_both,cov)
+    err[1,'OD'] = get_err(scov_od,cov)
+    
+    return(err)
+  }
+  res = map_dfr(seq(1,5000), sim_err) %>% mutate(n=n)
+}
+res_sample_size = map_dfr(seq(n_min, n_max, 1),sim_diag,.progress=TRUE)
+saveRDS(res_sample_size, 'n_corr_5000.rds')
+# res_sample_size = readRDS('n_corr.rds')
+# result_mean = res_sample_size %>% group_by(n) %>% summarise(across(everything(), ~mean(.))) %>% ungroup()
+# colnames(result_mean) = c('n',paste("mean", colnames(result_mean[,2:length(result_mean)]), sep = "_"))
+# result_sd = res_sample_size %>% group_by(n) %>% summarise(across(everything(), ~sd(.))) %>% ungroup()
+# colnames(result_sd) = paste("sd", colnames(result_sd), sep = "_")
+# result_tot = cbind(result_mean, result_sd[,2:ncol(result_sd)]) %>% 
+#   mutate(OASD_max = mean_OASD+1.96*(sd_OASD/sqrt(1000)),
+#          OAS_min = mean_OAS-1.96*(sd_OAS/sqrt(1000)),
+#          SS_min = mean_SS-1.96*(sd_SS/sqrt(1000)),
+#          RBLW_min = mean_RBLW-1.96*(sd_RBLW/sqrt(1000)),
+#          LW_min = mean_LW-1.96*(sd_LW/sqrt(1000)),
+#          s_min = mean_s-1.96*(sd_s/sqrt(1000)),
+#          OD_min = mean_OD-1.96*(sd_OD/sqrt(1000)),
+#          OB_min = mean_OB-1.96*(sd_OB/sqrt(1000)),
+#          OASB_min = mean_OASB-1.96*(sd_OASB/sqrt(1000)),
+#          Oracle_max = mean_Oracle+1.96*(sd_Oracle/sqrt(1000)))
+# result_filtered = result_tot %>% select(n, OASD_max, OAS_min, SS_min, RBLW_min, LW_min, s_min,OD_min,OB_min,OASB_min, Oracle_max) %>% mutate(across(-c(s_min,n), ~(.data$s_min-.)/.data$s_min)*100)
+# 
+# result_filtered = pivot_longer(result_filtered,cols=!n,names_to='method',values_to ='PRIAL')%>% mutate(ours = ifelse(method=='OASD',TRUE,FALSE))
+# # result = res_sample_size %>% group_by(n) %>% summarise(across(everything(), ~mean(.))) %>% ungroup() %>% mutate(across(-c(s,n), ~(.data$s-.)/.data$s)*100)
+# # result = pivot_longer(result,cols=!n,names_to='method',values_to ='PRIAL')%>% mutate(ours = ifelse(method=='OASD',TRUE,FALSE))
+# pl = ggplot(result_filtered %>% filter(!method %in% c('s_min', 'RBLW_min','OB_min','OASB_min','OD_min')), aes(x=n,y=PRIAL,group=method,color=method, linetype=ours))+geom_line()+scale_linetype_manual(values = c("TRUE" = "solid", "FALSE" = "dashed")) + xlab(TeX(r'($n$)')) + guides(linetype = "none") + theme(
+#   text = element_text(size = 12),              # Global text size
+#   axis.title = element_text(size = 12),         # Axis titles
+#   axis.text = element_text(size = 12),          # Axis text
+#   plot.title = element_text(size = 12),         # Plot title
+#   legend.title = element_text(size = 12),       # Legend title
+#   legend.text = element_text(size = 12),         # Legend text
+#   legend.position = "bottom"
+# )
+# # pl
+# # ggsave('n_corr.jpg', width = 6, height = 4)
+```
+
+```{r nl vs lw diag}
+r = 0.5
+n = 18
+corr = matrix(0, ncol=p, nrow=p)
+for (i in 1:p){
+  for (j in 1:p){
+    corr[i,j]=r^abs(i-j)
+  }
+}
+sim_diag <- function(large){
+  
+  sd = diag(c(rep(small,p/2),rep(large,p/2)))
+  cov = sd %*% corr %*% sd
+    
+  sim_err <- function(iter){
+
+    err = data.frame(matrix(nrow=1,ncol=5))
+    colnames(err) = c('lw','nl','lw_corr','nl_corr','s')
+    
+    # Generate samples from N(0,cov)
+    sample = mvrnorm(n, rep(0,p), cov)
+    
+    # Estimate the covariance matrix
+    scov = (t(sample) %*% sample)/nrow(sample)
+    f1 = (sum(diag(scov))/p)*diag(p)
+    f2 = diag(diag(scov))
+    tr_s = sum(diag(scov))
+    tr_s2 = sum(diag(t(scov) %*% scov))
+    tr_sdiag2 = sum(diag(diag(diag(scov)) %*% diag(diag(scov))))
+    
+    scorr = cov2cor(scov)
+    tr_s_cor = sum(diag(scorr))
+    tr_s2_cor = sum(diag(t(scorr) %*% scorr))
+    f1_cor = (sum(diag(scorr))/p)*diag(p)
+    sample_sc = sample %*% (diag(diag(f2)^(-1/2)))
+    
+    # Method 2&3: LW & RBLW
+    num = 0
+    for (i in 1:n){
+      fill = sum((matrix(sample[i,],ncol=1) %*% matrix(sample[i,],nrow=1) - scov)^2)
+      num = num + fill
+    }
+    den = (n^2)*(tr_s2-(tr_s^2)/p)
+    rou_lw = num/den
+    rou_lw = min(rou_lw,1)
+    scov_lw = (1-rou_lw)*scov+rou_lw*f1
+    
+    # # Method 9: Nonlinear
+    scov_nl = nlshrink_cov(sample,k=1)
+    
+    # LW corr
+    num = 0
+    for (i in 1:n){
+      fill = sum((matrix(sample_sc[i,],ncol=1) %*% matrix(sample_sc[i,],nrow=1) - scorr)^2)
+      num = num + fill
+    }
+    den = (n^2)*(tr_s2_cor-(tr_s_cor^2)/p)
+    rou_lw = num/den
+    rou_lw = min(rou_lw,1)
+    scorr_lw = (1-rou_lw)*scorr+rou_lw*f1_cor
+    scov_lw_corr = (f2^(1/2)) %*% scorr_lw %*% (f2^(1/2))
+    
+    # NL corr
+    scorr_nl = nlshrink_cov(sample_sc,k=1)
+    scov_nl_corr = (f2^(1/2)) %*% scorr_nl %*% (f2^(1/2))
+    
+    # Collect errors
+    err[1,'lw'] = get_err(scov_lw,cov)
+    err[1, 'nl'] = get_err(scov_nl, cov)
+    err[1, 's'] = get_err(scov, cov)
+    err[1, 'lw_corr'] = get_err(scov_lw_corr, cov)
+    err[1, 'nl_corr'] = get_err(scov_nl_corr, cov)
+    
+    print(iter)
+    return(err)
+  }
+  res = map_dfr(seq(1,100), sim_err) %>% mutate(large = large)
+}
+res_sample_size = map_dfr(seq(large_min,large_max,1),sim_diag,.progress=TRUE)
+saveRDS(res_sample_size, 'nlvslw_diag.rds')
+# we can do two-sample t-test to prove they are similar
+results_tab = res_sample_size %>% group_by(large) %>% summarise(
+  t_stat = t.test(lw,nl)$statistic,
+  p_value = t.test(lw,nl)$p.value,
+  mean_diff = mean(lw)-mean(nl),
+  conf_low = t.test(lw,nl)$conf.int[1],
+  conf_high = t.test(lw,nl)$conf.int[2]
+) %>% mutate(
+  p_value=paste0(format(p_value, scientific = TRUE, digits = 3), 
+                     case_when(
+                       p_value < 0.001 ~ "***",
+                       p_value < 0.01  ~ "**",
+                       p_value < 0.05  ~ "*",
+                       TRUE            ~ ""
+                     )
+    )
+)
+stargazer(as.data.frame(results_tab), type='latex',summary=FALSE)
+```
+
+```{r nl vs lw r}
+large = 10
+n = 18
+
+sim_diag <- function(r){
+  
+  corr = matrix(0, ncol=p, nrow=p)
+  for (i in 1:p){
+    for (j in 1:p){
+      corr[i,j]=r^abs(i-j)
+    }
+  }
+  sd = diag(c(rep(small,p/2),rep(large,p/2)))
+  cov = sd %*% corr %*% sd
+    
+  sim_err <- function(iter){
+
+    err = data.frame(matrix(nrow=1,ncol=5))
+    colnames(err) = c('lw','nl','lw_corr','nl_corr','s')
+    
+    # Generate samples from N(0,cov)
+    sample = mvrnorm(n, rep(0,p), cov)
+    
+    # Estimate the covariance matrix
+    scov = (t(sample) %*% sample)/nrow(sample)
+    f1 = (sum(diag(scov))/p)*diag(p)
+    f2 = diag(diag(scov))
+    tr_s = sum(diag(scov))
+    tr_s2 = sum(diag(t(scov) %*% scov))
+    tr_sdiag2 = sum(diag(diag(diag(scov)) %*% diag(diag(scov))))
+    
+    scorr = cov2cor(scov)
+    tr_s_cor = sum(diag(scorr))
+    tr_s2_cor = sum(diag(t(scorr) %*% scorr))
+    f1_cor = (sum(diag(scorr))/p)*diag(p)
+    sample_sc = sample %*% (diag(diag(f2)^(-1/2)))
+    
+    # Method 2&3: LW & RBLW
+    num = 0
+    for (i in 1:n){
+      fill = sum((matrix(sample[i,],ncol=1) %*% matrix(sample[i,],nrow=1) - scov)^2)
+      num = num + fill
+    }
+    den = (n^2)*(tr_s2-(tr_s^2)/p)
+    rou_lw = num/den
+    rou_lw = min(rou_lw,1)
+    scov_lw = (1-rou_lw)*scov+rou_lw*f1
+    
+    # # Method 9: Nonlinear
+    scov_nl = nlshrink_cov(sample,k=1)
+    
+    # LW corr
+    num = 0
+    for (i in 1:n){
+      fill = sum((matrix(sample_sc[i,],ncol=1) %*% matrix(sample_sc[i,],nrow=1) - scorr)^2)
+      num = num + fill
+    }
+    den = (n^2)*(tr_s2_cor-(tr_s_cor^2)/p)
+    rou_lw = num/den
+    rou_lw = min(rou_lw,1)
+    scorr_lw = (1-rou_lw)*scorr+rou_lw*f1_cor
+    scov_lw_corr = (f2^(1/2)) %*% scorr_lw %*% (f2^(1/2))
+    
+    # NL corr
+    scorr_nl = nlshrink_cov(sample_sc,k=1)
+    scov_nl_corr = (f2^(1/2)) %*% scorr_nl %*% (f2^(1/2))
+    
+    # Collect errors
+    err[1,'lw'] = get_err(scov_lw,cov)
+    err[1, 'nl'] = get_err(scov_nl, cov)
+    err[1, 's'] = get_err(scov, cov)
+    err[1, 'lw_corr'] = get_err(scov_lw_corr, cov)
+    err[1, 'nl_corr'] = get_err(scov_nl_corr, cov)
+    
+    print(iter)
+    return(err)
+  }
+  res = map_dfr(seq(1,100), sim_err) %>% mutate(r=r)
+}
+res_sample_size = map_dfr(seq(r_min,r_max,0.1),sim_diag,.progress=TRUE)
+saveRDS(res_sample_size, 'nlvslw_r.rds')
+# we can do two-sample t-test to prove they are similar
+results_tab = res_sample_size %>% group_by(r) %>% summarise(
+  t_stat = t.test(lw,nl)$statistic,
+  p_value = t.test(lw,nl)$p.value,
+  mean_diff = mean(lw)-mean(nl),
+  conf_low = t.test(lw,nl)$conf.int[1],
+  conf_high = t.test(lw,nl)$conf.int[2]
+) %>% mutate(
+  p_value=paste0(format(p_value, scientific = TRUE, digits = 3), 
+                     case_when(
+                       p_value < 0.001 ~ "***",
+                       p_value < 0.01  ~ "**",
+                       p_value < 0.05  ~ "*",
+                       TRUE            ~ ""
+                     )
+    )
+)
+stargazer(as.data.frame(results_tab), type='latex',summary=FALSE)
+```
+
+```{r nl vs lw n}
+large = 10
+r = 0.5
+
+sim_diag <- function(n){
+  
+  corr = matrix(0, ncol=p, nrow=p)
+  for (i in 1:p){
+    for (j in 1:p){
+      corr[i,j]=r^abs(i-j)
+    }
+  }
+  sd = diag(c(rep(small,p/2),rep(large,p/2)))
+  cov = sd %*% corr %*% sd
+    
+  sim_err <- function(iter){
+
+    err = data.frame(matrix(nrow=1,ncol=5))
+    colnames(err) = c('lw','nl','lw_corr','nl_corr','s')
+    
+    # Generate samples from N(0,cov)
+    sample = mvrnorm(n, rep(0,p), cov)
+    
+    # Estimate the covariance matrix
+    scov = (t(sample) %*% sample)/nrow(sample)
+    f1 = (sum(diag(scov))/p)*diag(p)
+    f2 = diag(diag(scov))
+    tr_s = sum(diag(scov))
+    tr_s2 = sum(diag(t(scov) %*% scov))
+    tr_sdiag2 = sum(diag(diag(diag(scov)) %*% diag(diag(scov))))
+    
+    scorr = cov2cor(scov)
+    tr_s_cor = sum(diag(scorr))
+    tr_s2_cor = sum(diag(t(scorr) %*% scorr))
+    f1_cor = (sum(diag(scorr))/p)*diag(p)
+    sample_sc = sample %*% (diag(diag(f2)^(-1/2)))
+    
+    # Method 2&3: LW & RBLW
+    num = 0
+    for (i in 1:n){
+      fill = sum((matrix(sample[i,],ncol=1) %*% matrix(sample[i,],nrow=1) - scov)^2)
+      num = num + fill
+    }
+    den = (n^2)*(tr_s2-(tr_s^2)/p)
+    rou_lw = num/den
+    rou_lw = min(rou_lw,1)
+    scov_lw = (1-rou_lw)*scov+rou_lw*f1
+    
+    # # Method 9: Nonlinear
+    scov_nl = nlshrink_cov(sample,k=1)
+    
+    # LW corr
+    num = 0
+    for (i in 1:n){
+      fill = sum((matrix(sample_sc[i,],ncol=1) %*% matrix(sample_sc[i,],nrow=1) - scorr)^2)
+      num = num + fill
+    }
+    den = (n^2)*(tr_s2_cor-(tr_s_cor^2)/p)
+    rou_lw = num/den
+    rou_lw = min(rou_lw,1)
+    scorr_lw = (1-rou_lw)*scorr+rou_lw*f1_cor
+    scov_lw_corr = (f2^(1/2)) %*% scorr_lw %*% (f2^(1/2))
+    
+    # NL corr
+    scorr_nl = nlshrink_cov(sample_sc,k=1)
+    scov_nl_corr = (f2^(1/2)) %*% scorr_nl %*% (f2^(1/2))
+    
+    # Collect errors
+    err[1,'lw'] = get_err(scov_lw,cov)
+    err[1, 'nl'] = get_err(scov_nl, cov)
+    err[1, 's'] = get_err(scov, cov)
+    err[1, 'lw_corr'] = get_err(scov_lw_corr, cov)
+    err[1, 'nl_corr'] = get_err(scov_nl_corr, cov)
+    
+    print(iter)
+    return(err)
+  }
+  res = map_dfr(seq(1,100), sim_err) %>% mutate(n=n)
+}
+res_sample_size = map_dfr(seq(n_min,n_max,1),sim_diag,.progress=TRUE)
+saveRDS(res_sample_size, 'nlvslw_n.rds')
+# we can do two-sample t-test to prove they are similar
+results_tab = res_sample_size %>% group_by(n) %>% summarise(
+  t_stat = t.test(lw,nl)$statistic,
+  p_value = t.test(lw,nl)$p.value,
+  mean_diff = mean(lw)-mean(nl),
+  conf_low = t.test(lw,nl)$conf.int[1],
+  conf_high = t.test(lw,nl)$conf.int[2]
+) %>% mutate(
+  p_value=paste0(format(p_value, scientific = TRUE, digits = 3), 
+                     case_when(
+                       p_value < 0.001 ~ "***",
+                       p_value < 0.01  ~ "**",
+                       p_value < 0.05  ~ "*",
+                       TRUE            ~ ""
+                     )
+    )
+)
+stargazer(as.data.frame(results_tab), type='latex',summary=FALSE)
+```
+
+```{r iterative convergence of gamma in n}
+# didnt converge
+r = 0.5
+# n = 18
+large = 10
+
+corr = matrix(0, ncol=p, nrow=p)
+for (i in 1:p){
+  for (j in 1:p){
+    corr[i,j]=r^abs(i-j)
+  }
+}
+sd = diag(c(rep(small,p/2),rep(large,p/2)))
+cov = sd %*% corr %*% sd
+
+sim <- function(n){
+  print(n)
+  sim_err <- function(iter){
+  
+  # ncol here is the number of iterations
+  gamma_df = data.frame(matrix(nrow=1,ncol=61))
+  colnames(gamma_df) = c(as.character(seq(1, 60)),'gamma_oas')
+  
+  # Generate samples from N(0,cov)
+  sample = mvrnorm(n, rep(0,p), cov)
+  
+  # Estimate the covariance matrix
+  scov = (t(sample) %*% sample)/nrow(sample)
+  f1 = (sum(diag(scov))/p)*diag(p)
+  f2 = diag(diag(scov))
+  tr_s = sum(diag(scov))
+  tr_s2 = sum(diag(t(scov) %*% scov))
+  tr_sdiag2 = sum(diag(diag(diag(scov)) %*% diag(diag(scov))))
+  
+  tr_t = sum(diag(cov))
+  tr_t2 = sum(diag(t(cov) %*% cov))
+  tr_tdiag2 = sum(diag(diag(diag(cov)) %*% diag(diag(cov))))
+  
+  # Method 5: oas_v
+  phi1 = (tr_s2-tr_sdiag2)/(tr_s2+tr_s^2-2*tr_sdiag2)
+  rou_oas_variant = min(1/((n+1)*phi1),1)
+  
+  # Method oracle
+  rou_o_variant = ((1/n)*tr_t2-(2/n)*tr_tdiag2+(1/n)*tr_t^2)/(((n+1)/n)*tr_t2+(1/n)*tr_t^2-((n+2)/n)*tr_tdiag2)
+  
+  # Method 9: Oracle_b
+    P = tr_tdiag2
+    R = tr_t2
+    Q = tr_t^2
+    
+    rou_b_o = (Q+R-2*P)/((n+1)*R+Q-(n+2)*P)
+    gamma_b_o = 1-(1/rou_b_o)*(((2/n)*P-(2/(n*p))*R)/(((n+2)/n)*P-(2/(n*p))*R-(1/p)*Q))
+    
+    # Method 10: oas_b
+    theta = rou_oas_variant
+    A = (tr_s^2)/p
+    B = tr_s2-tr_sdiag2
+    C = tr_sdiag2-A
+    
+    t1 = ((p-1)*C)/((p-1)*(A+C)-B)
+    t2 = (B-(p-1)*C)/((p-1)*(A+C)-B)
+    t3 = (n*p*C)/(2*(p-1)*(A+C)-2*B)
+    
+    if (abs(t3/((t1+t2)*theta+1-t1))<1){
+      gamma_oas = (theta-1)/(theta)
+    }else{
+      gamma_oas = (theta*(t3-t2)-1)/(theta*(t1+t3))
+    }
+    gamma_df[1, 'gamma_oas'] = gamma_oas
+  
+  gamma_df[1,'1'] = 1-(1/rou_oas_variant)*((2*p*tr_sdiag2-2*tr_s2)/(p*(n+2)*tr_sdiag2-2*tr_s2-n*tr_s^2))
+  
+  for (s in 2:60){
+    gamma_prev = gamma_df[1,as.character(s-1)]
+    sig_prev = (1-rou_oas_variant)*scov+rou_oas_variant*(gamma_prev*f2+(1-gamma_prev)*f1)
+    gamma_df[1,as.character(s)] = 1-(1/rou_oas_variant)*((2*p*(sum(diag(diag(diag(sig_prev)) %*% f2)))-2*(sum(diag(sig_prev %*% scov))))/(p*(n+2)*(sum(diag(diag(diag(sig_prev)) %*% f2)))-2*(sum(diag(sig_prev %*% scov)))-n*sum(diag(sig_prev))^2))
+  }
+  
+  for (i in 1:ncol(gamma_df)){
+    gamma_df[1,colnames(gamma_df)[i]] = (gamma_df[1,colnames(gamma_df)[i]]-gamma_b_o)^2
+  }
+  
+  return(gamma_df)
+  }
+  res_sample_size = map_dfr(seq(1,1000),sim_err,.progress=TRUE)
+  result = res_sample_size %>% summarise(across(everything(), ~mean(.)))
+  result = pivot_longer(result, everything(), names_to = 'iteration', values_to = 'MSE')
+}
+res_sample_size = map_dfc(seq(n_min, n_max, 1),sim,.progress=TRUE)
+
+saveRDS(res_sample_size, 'gamma_converge_n.rds')
+result = res_sample_size[,c(1,seq(2,50,2))]
+colnames(result) = c('iteration',as.character(seq(n_min, n_max, 1)))
+result = result %>% pivot_longer(!iteration, names_to='n',values_to='MSE')
+result = result %>% mutate(color_iter = as.numeric(iteration), n=as.numeric(n))
+ggplot(result %>% mutate(MSE = sqrt(MSE)), aes(x=n,y=MSE,color=color_iter,group=iteration))+geom_line()+scale_color_gradient(low = "lightblue", high = "blue", breaks = c(1,5,10,15,20,25,30), name='Iterations',na.value = "red")+ylab(TeX(r'(RMSE of $\hat{gamma}_j$)'))
+ggsave('iter_n_gamma.jpg')
+```
+
+```{r iterative convergence of rho in r}
+n = 18
+large = 10
+p=100
+
+
+sim <- function(r){
+  print(r)
+  corr = matrix(0, ncol=p, nrow=p)
+  for (i in 1:p){
+    for (j in 1:p){
+      corr[i,j]=r^abs(i-j)
+    }
+  }
+  sd = diag(c(rep(small,p/2),rep(large,p/2)))
+  cov = sd %*% corr %*% sd
+  sim_err <- function(iter){
+
+  rho_df = data.frame(matrix(nrow=1,ncol=31))
+  colnames(rho_df) = c(as.character(seq(1, 30)),'rho_oasv')
+  
+  # Generate samples from N(0,cov)
+  sample = mvrnorm(n, rep(0,p), cov)
+  
+  # Estimate the covariance matrix
+  scov = (t(sample) %*% sample)/nrow(sample)
+  f1 = (sum(diag(scov))/p)*diag(p)
+  f2 = diag(diag(scov))
+  tr_s = sum(diag(scov))
+  tr_s2 = sum(diag(t(scov) %*% scov))
+  tr_sdiag2 = sum(diag(diag(diag(scov)) %*% diag(diag(scov))))
+  
+  tr_t = sum(diag(cov))
+  tr_t2 = sum(diag(t(cov) %*% cov))
+  tr_tdiag2 = sum(diag(diag(diag(cov)) %*% diag(diag(cov))))
+  
+  # Method 5: oas_v
+  phi1 = (tr_s2-tr_sdiag2)/(tr_s2+tr_s^2-2*tr_sdiag2)
+  rou_oas_variant = min(1/((n+1)*phi1),1)
+  rho_df[1, 'rho_oasv'] = rou_oas_variant
+  
+  # Method oracle
+  rou_o_variant = ((1/n)*tr_t2-(2/n)*tr_tdiag2+(1/n)*tr_t^2)/(((n+1)/n)*tr_t2+(1/n)*tr_t^2-((n+2)/n)*tr_tdiag2)
+  
+  rho_df[1,'1'] = (tr_s2-2*tr_sdiag2+tr_s^2)/((n+1)*tr_s2+tr_s^2-(n+2)*tr_sdiag2)
+  
+  for (s in 2:30){
+    rho_prev = rho_df[1,as.character(s-1)]
+    sig_prev = (1-rho_prev)*scov+rho_prev*f2
+    rho_df[1,as.character(s)] = (sum(diag(sig_prev %*% scov))-2*sum(diag(sig_prev)^2)+sum(diag(sig_prev))^2)/((n+1)*sum(diag(sig_prev %*% scov))+sum(diag(sig_prev))^2-(n+2)*sum(diag(sig_prev)^2))
+  }
+  
+  for (i in 1:ncol(rho_df)){
+    rho_df[1,colnames(rho_df)[i]] = (rho_df[1,colnames(rho_df)[i]]-rou_o_variant)^2
+  }
+  
+  return(rho_df)
+  }
+  res_sample_size = map_dfr(seq(1,1000),sim_err,.progress=TRUE)
+  result = res_sample_size %>% summarise(across(everything(), ~mean(.)))
+  result = pivot_longer(result, everything(), names_to = 'iteration', values_to = 'MSE')
+}
+res_sample_size = map_dfc(seq(r_min, r_max, 0.1),sim,.progress=TRUE)
+saveRDS(res_sample_size, 'rho_converge_r.rds')
+result = res_sample_size[,c(1,seq(2,20,2))]
+colnames(result) = c('iteration',as.character(seq(r_min, r_max, 0.1)))
+result = result %>% pivot_longer(!iteration, names_to='r',values_to='MSE')
+result = result %>% mutate(color_iter = as.numeric(iteration), r=as.numeric(r))
+ggplot(result %>% mutate(MSE = sqrt(MSE)), aes(x=r,y=MSE,color=color_iter,group=iteration))+geom_line()+scale_color_gradient(low = "lightblue", high = "blue", breaks = c(1,3,5,7, 9), name='Iterations',na.value = "red")+ylab(TeX(r'(RMSE of $\hat{rho}_j$)'))
+ggsave('iter_r.jpg')
+```
+
+```{r iterative convergence of rho in large}
+n = 18
+p=100
+
+sim <- function(large){
+  print(large)
+  corr = matrix(0, ncol=p, nrow=p)
+  for (i in 1:p){
+    for (j in 1:p){
+      corr[i,j]=r^abs(i-j)
+    }
+  }
+  sd = diag(c(rep(small,p/2),rep(large,p/2)))
+  cov = sd %*% corr %*% sd
+  sim_err <- function(iter){
+
+  rho_df = data.frame(matrix(nrow=1,ncol=31))
+  colnames(rho_df) = c(as.character(seq(1, 30)),'rho_oasv')
+  
+  # Generate samples from N(0,cov)
+  sample = mvrnorm(n, rep(0,p), cov)
+  
+  # Estimate the covariance matrix
+  scov = (t(sample) %*% sample)/nrow(sample)
+  f1 = (sum(diag(scov))/p)*diag(p)
+  f2 = diag(diag(scov))
+  tr_s = sum(diag(scov))
+  tr_s2 = sum(diag(t(scov) %*% scov))
+  tr_sdiag2 = sum(diag(diag(diag(scov)) %*% diag(diag(scov))))
+  
+  tr_t = sum(diag(cov))
+  tr_t2 = sum(diag(t(cov) %*% cov))
+  tr_tdiag2 = sum(diag(diag(diag(cov)) %*% diag(diag(cov))))
+  
+  # Method 5: oas_v
+  phi1 = (tr_s2-tr_sdiag2)/(tr_s2+tr_s^2-2*tr_sdiag2)
+  rou_oas_variant = min(1/((n+1)*phi1),1)
+  rho_df[1, 'rho_oasv'] = rou_oas_variant
+  
+  # Method oracle
+  rou_o_variant = ((1/n)*tr_t2-(2/n)*tr_tdiag2+(1/n)*tr_t^2)/(((n+1)/n)*tr_t2+(1/n)*tr_t^2-((n+2)/n)*tr_tdiag2)
+  
+  rho_df[1,'1'] = (tr_s2-2*tr_sdiag2+tr_s^2)/((n+1)*tr_s2+tr_s^2-(n+2)*tr_sdiag2)
+  
+  for (s in 2:30){
+    rho_prev = rho_df[1,as.character(s-1)]
+    sig_prev = (1-rho_prev)*scov+rho_prev*f2
+    rho_df[1,as.character(s)] = (sum(diag(sig_prev %*% scov))-2*sum(diag(sig_prev)^2)+sum(diag(sig_prev))^2)/((n+1)*sum(diag(sig_prev %*% scov))+sum(diag(sig_prev))^2-(n+2)*sum(diag(sig_prev)^2))
+  }
+  
+  for (i in 1:ncol(rho_df)){
+    rho_df[1,colnames(rho_df)[i]] = (rho_df[1,colnames(rho_df)[i]]-rou_o_variant)^2
+  }
+  
+  return(rho_df)
+  }
+  res_sample_size = map_dfr(seq(1,1000),sim_err,.progress=TRUE)
+  result = res_sample_size %>% summarise(across(everything(), ~mean(.)))
+  result = pivot_longer(result, everything(), names_to = 'iteration', values_to = 'MSE')
+}
+res_sample_size = map_dfc(seq(large_min, large_max, 1),sim,.progress=TRUE)
+saveRDS(res_sample_size, 'rho_converge_large.rds')
+result = res_sample_size[,c(1,seq(2,20,2))]
+colnames(result) = c('iteration',as.character(seq(large_min, large_max, 1)))
+result = result %>% pivot_longer(!iteration, names_to='large',values_to='MSE')
+result = result %>% mutate(color_iter = as.numeric(iteration), large=as.numeric(large))
+ggplot(result %>% mutate(MSE = sqrt(MSE)), aes(x=large,y=MSE,color=color_iter,group=iteration))+geom_line()+scale_color_gradient(low = "lightblue", high = "blue", breaks = c(1,3,5,7, 9), name='Iterations',na.value = "red")+ylab(TeX(r'(RMSE of $\hat{rho}_j$)'))+xlab(TeX(r'($sd_{large}$)'))
+ggsave('iter_large.jpg')
+```
+
+
+```{r iterative convergence of rho in n}
+
+r = 0.5
+# n = 18
+large = 10
+
+corr = matrix(0, ncol=p, nrow=p)
+for (i in 1:p){
+  for (j in 1:p){
+    corr[i,j]=r^abs(i-j)
+  }
+}
+sd = diag(c(rep(small,p/2),rep(large,p/2)))
+cov = sd %*% corr %*% sd
+
+sim <- function(n){
+  sim_err <- function(iter){
+  
+  # ncol here is the number of iterations
+  rho_df = data.frame(matrix(nrow=1,ncol=31))
+  colnames(rho_df) = c(as.character(seq(1, 30)),'rho_oasv')
+  
+  # Generate samples from N(0,cov)
+  sample = mvrnorm(n, rep(0,p), cov)
+  
+  # Estimate the covariance matrix
+  scov = (t(sample) %*% sample)/nrow(sample)
+  f1 = (sum(diag(scov))/p)*diag(p)
+  f2 = diag(diag(scov))
+  tr_s = sum(diag(scov))
+  tr_s2 = sum(diag(t(scov) %*% scov))
+  tr_sdiag2 = sum(diag(diag(diag(scov)) %*% diag(diag(scov))))
+  
+  tr_t = sum(diag(cov))
+  tr_t2 = sum(diag(t(cov) %*% cov))
+  tr_tdiag2 = sum(diag(diag(diag(cov)) %*% diag(diag(cov))))
+  
+  # Method 5: oas_v
+  phi1 = (tr_s2-tr_sdiag2)/(tr_s2+tr_s^2-2*tr_sdiag2)
+  rou_oas_variant = min(1/((n+1)*phi1),1)
+  rho_df[1, 'rho_oasv'] = rou_oas_variant
+  
+  # Method oracle
+  rou_o_variant = ((1/n)*tr_t2-(2/n)*tr_tdiag2+(1/n)*tr_t^2)/(((n+1)/n)*tr_t2+(1/n)*tr_t^2-((n+2)/n)*tr_tdiag2)
+  
+  rho_df[1,'1'] = (tr_s2-2*tr_sdiag2+tr_s^2)/((n+1)*tr_s2+tr_s^2-(n+2)*tr_sdiag2)
+  
+  for (s in 2:30){
+    rho_prev = rho_df[1,as.character(s-1)]
+    sig_prev = (1-rho_prev)*scov+rho_prev*f2
+    rho_df[1,as.character(s)] = (sum(diag(sig_prev %*% scov))-2*sum(diag(sig_prev)^2)+sum(diag(sig_prev))^2)/((n+1)*sum(diag(sig_prev %*% scov))+sum(diag(sig_prev))^2-(n+2)*sum(diag(sig_prev)^2))
+  }
+  
+  for (i in 1:ncol(rho_df)){
+    rho_df[1,colnames(rho_df)[i]] = (rho_df[1,colnames(rho_df)[i]]-rou_o_variant)^2
+  }
+  
+  return(rho_df)
+  }
+  res_sample_size = map_dfr(seq(1,1000),sim_err,.progress=TRUE)
+  result = res_sample_size %>% summarise(across(everything(), ~mean(.)))
+  result = pivot_longer(result, everything(), names_to = 'iteration', values_to = 'MSE')
+}
+res_sample_size = map_dfc(seq(n_min, n_max, 1),sim,.progress=TRUE)
+
+saveRDS(res_sample_size, 'rho_converge.rds')
+result = res_sample_size[,c(1,seq(2,50,2))]
+colnames(result) = c('iteration',as.character(seq(n_min, n_max, 1)))
+result = result %>% pivot_longer(!iteration, names_to='n',values_to='MSE')
+result = result %>% mutate(color_iter = as.numeric(iteration), n=as.numeric(n))
+ggplot(result %>% mutate(MSE = sqrt(MSE)), aes(x=n,y=MSE,color=color_iter,group=iteration))+geom_line()+scale_color_gradient(low = "lightblue", high = "blue", breaks = c(1,5,10,15,20,25,30), name='Iterations',na.value = "red")+ylab(TeX(r'(RMSE of $\hat{rho}_j$)'))
+ggsave('iter_n.jpg')
+```
+
+```{r iterative convergence of gamma in r}
+n = 18
+large = 10
+p=100
+
+
+sim <- function(r){
+  print(r)
+  corr = matrix(0, ncol=p, nrow=p)
+  for (i in 1:p){
+    for (j in 1:p){
+      corr[i,j]=r^abs(i-j)
+    }
+  }
+  sd = diag(c(rep(small,p/2),rep(large,p/2)))
+  cov = sd %*% corr %*% sd
+  sim_err <- function(iter){
+
+    # ncol here is the number of iterations
+  gamma_df = data.frame(matrix(nrow=1,ncol=61))
+  colnames(gamma_df) = c(as.character(seq(1, 60)),'gamma_oas')
+  
+  # Generate samples from N(0,cov)
+  sample = mvrnorm(n, rep(0,p), cov)
+  
+  # Estimate the covariance matrix
+  scov = (t(sample) %*% sample)/nrow(sample)
+  f1 = (sum(diag(scov))/p)*diag(p)
+  f2 = diag(diag(scov))
+  tr_s = sum(diag(scov))
+  tr_s2 = sum(diag(t(scov) %*% scov))
+  tr_sdiag2 = sum(diag(diag(diag(scov)) %*% diag(diag(scov))))
+  
+  tr_t = sum(diag(cov))
+  tr_t2 = sum(diag(t(cov) %*% cov))
+  tr_tdiag2 = sum(diag(diag(diag(cov)) %*% diag(diag(cov))))
+  
+  # Method 5: oas_v
+  phi1 = (tr_s2-tr_sdiag2)/(tr_s2+tr_s^2-2*tr_sdiag2)
+  rou_oas_variant = min(1/((n+1)*phi1),1)
+  
+  # Method oracle
+  rou_o_variant = ((1/n)*tr_t2-(2/n)*tr_tdiag2+(1/n)*tr_t^2)/(((n+1)/n)*tr_t2+(1/n)*tr_t^2-((n+2)/n)*tr_tdiag2)
+  
+  # Method 9: Oracle_b
+    P = tr_tdiag2
+    R = tr_t2
+    Q = tr_t^2
+    
+    rou_b_o = (Q+R-2*P)/((n+1)*R+Q-(n+2)*P)
+    gamma_b_o = 1-(1/rou_b_o)*(((2/n)*P-(2/(n*p))*R)/(((n+2)/n)*P-(2/(n*p))*R-(1/p)*Q))
+    
+    # Method 10: oas_b
+    theta = rou_oas_variant
+    A = (tr_s^2)/p
+    B = tr_s2-tr_sdiag2
+    C = tr_sdiag2-A
+    
+    t1 = ((p-1)*C)/((p-1)*(A+C)-B)
+    t2 = (B-(p-1)*C)/((p-1)*(A+C)-B)
+    t3 = (n*p*C)/(2*(p-1)*(A+C)-2*B)
+    
+    if (abs(t3/((t1+t2)*theta+1-t1))<1){
+      gamma_oas = (theta-1)/(theta)
+    }else{
+      gamma_oas = (theta*(t3-t2)-1)/(theta*(t1+t3))
+    }
+    gamma_df[1, 'gamma_oas'] = gamma_oas
+  
+  gamma_df[1,'1'] = 1-(1/rou_oas_variant)*((2*p*tr_sdiag2-2*tr_s2)/(p*(n+2)*tr_sdiag2-2*tr_s2-n*tr_s^2))
+  
+  for (s in 2:60){
+    gamma_prev = gamma_df[1,as.character(s-1)]
+    sig_prev = (1-rou_oas_variant)*scov+rou_oas_variant*(gamma_prev*f2+(1-gamma_prev)*f1)
+    gamma_df[1,as.character(s)] = 1-(1/rou_oas_variant)*((2*p*(sum(diag(diag(diag(sig_prev)) %*% f2)))-2*(sum(diag(sig_prev %*% scov))))/(p*(n+2)*(sum(diag(diag(diag(sig_prev)) %*% f2)))-2*(sum(diag(sig_prev %*% scov)))-n*sum(diag(sig_prev))^2))
+  }
+  
+  for (i in 1:ncol(gamma_df)){
+    gamma_df[1,colnames(gamma_df)[i]] = (gamma_df[1,colnames(gamma_df)[i]]-gamma_b_o)^2
+  }
+  
+  return(gamma_df)
+  }
+  res_sample_size = map_dfr(seq(1,1000),sim_err,.progress=TRUE)
+  result = res_sample_size %>% summarise(across(everything(), ~mean(.)))
+  result = pivot_longer(result, everything(), names_to = 'iteration', values_to = 'MSE')
+}
+res_sample_size = map_dfc(seq(r_min, r_max, 0.1),sim,.progress=TRUE)
+saveRDS(res_sample_size, 'rho_converge_r.rds')
+result = res_sample_size[,c(1,seq(2,20,2))]
+colnames(result) = c('iteration',as.character(seq(r_min, r_max, 0.1)))
+result = result %>% pivot_longer(!iteration, names_to='r',values_to='MSE')
+result = result %>% mutate(color_iter = as.numeric(iteration), r=as.numeric(r))
+ggplot(result %>% mutate(MSE = sqrt(MSE)), aes(x=r,y=MSE,color=color_iter,group=iteration))+geom_line()+scale_color_gradient(low = "lightblue", high = "blue", breaks = c(1,5,10,15,20,25,30), name='Iterations',na.value = "red")+ylab(TeX(r'(RMSE of $\hat{rho}_j$)'))
+ggsave('iter_r_gamma.jpg')
+```
+
+```{r iterative convergence of gamma in large}
+n = 18
+p=100
+
+sim <- function(large){
+  print(large)
+  corr = matrix(0, ncol=p, nrow=p)
+  for (i in 1:p){
+    for (j in 1:p){
+      corr[i,j]=r^abs(i-j)
+    }
+  }
+  sd = diag(c(rep(small,p/2),rep(large,p/2)))
+  cov = sd %*% corr %*% sd
+  sim_err <- function(iter){
+
+  rho_df = data.frame(matrix(nrow=1,ncol=31))
+  colnames(rho_df) = c(as.character(seq(1, 30)),'rho_oasv')
+  
+  # Generate samples from N(0,cov)
+  sample = mvrnorm(n, rep(0,p), cov)
+  
+  # Estimate the covariance matrix
+  scov = (t(sample) %*% sample)/nrow(sample)
+  f1 = (sum(diag(scov))/p)*diag(p)
+  f2 = diag(diag(scov))
+  tr_s = sum(diag(scov))
+  tr_s2 = sum(diag(t(scov) %*% scov))
+  tr_sdiag2 = sum(diag(diag(diag(scov)) %*% diag(diag(scov))))
+  
+  tr_t = sum(diag(cov))
+  tr_t2 = sum(diag(t(cov) %*% cov))
+  tr_tdiag2 = sum(diag(diag(diag(cov)) %*% diag(diag(cov))))
+  
+  # Method 5: oas_v
+  phi1 = (tr_s2-tr_sdiag2)/(tr_s2+tr_s^2-2*tr_sdiag2)
+  rou_oas_variant = min(1/((n+1)*phi1),1)
+  rho_df[1, 'rho_oasv'] = rou_oas_variant
+  
+  # Method oracle
+  rou_o_variant = ((1/n)*tr_t2-(2/n)*tr_tdiag2+(1/n)*tr_t^2)/(((n+1)/n)*tr_t2+(1/n)*tr_t^2-((n+2)/n)*tr_tdiag2)
+  
+  rho_df[1,'1'] = (tr_s2-2*tr_sdiag2+tr_s^2)/((n+1)*tr_s2+tr_s^2-(n+2)*tr_sdiag2)
+  
+  for (s in 2:30){
+    rho_prev = rho_df[1,as.character(s-1)]
+    sig_prev = (1-rho_prev)*scov+rho_prev*f2
+    rho_df[1,as.character(s)] = (sum(diag(sig_prev %*% scov))-2*sum(diag(sig_prev)^2)+sum(diag(sig_prev))^2)/((n+1)*sum(diag(sig_prev %*% scov))+sum(diag(sig_prev))^2-(n+2)*sum(diag(sig_prev)^2))
+  }
+  
+  for (i in 1:ncol(rho_df)){
+    rho_df[1,colnames(rho_df)[i]] = (rho_df[1,colnames(rho_df)[i]]-rou_o_variant)^2
+  }
+  
+  return(rho_df)
+  }
+  res_sample_size = map_dfr(seq(1,1000),sim_err,.progress=TRUE)
+  result = res_sample_size %>% summarise(across(everything(), ~mean(.)))
+  result = pivot_longer(result, everything(), names_to = 'iteration', values_to = 'MSE')
+}
+res_sample_size = map_dfc(seq(large_min, large_max, 1),sim,.progress=TRUE)
+saveRDS(res_sample_size, 'rho_converge_large.rds')
+result = res_sample_size[,c(1,seq(2,20,2))]
+colnames(result) = c('iteration',as.character(seq(large_min, large_max, 1)))
+result = result %>% pivot_longer(!iteration, names_to='large',values_to='MSE')
+result = result %>% mutate(color_iter = as.numeric(iteration), large=as.numeric(large))
+ggplot(result %>% mutate(MSE = sqrt(MSE)), aes(x=large,y=MSE,color=color_iter,group=iteration))+geom_line()+scale_color_gradient(low = "lightblue", high = "blue", breaks = c(1,3,5,7, 9), name='Iterations',na.value = "red")+ylab(TeX(r'(RMSE of $\hat{rho}_j$)'))+xlab(TeX(r'($sd_{large}$)'))
+ggsave('iter_large.jpg')
+```
+
+
+```{r inverse diag}
+r = 0.5
+n = 18
+corr = matrix(0, ncol=p, nrow=p)
+for (i in 1:p){
+  for (j in 1:p){
+    corr[i,j]=r^abs(i-j)
+  }
+}
+
+sim_diag <- function(large){
+  
+  sd = diag(c(rep(small,p/2),rep(large,p/2)))
+  cov = sd %*% corr %*% sd
+    
+  sim_err <- function(iter){
+
+    err = data.frame(matrix(nrow=1,ncol=11))
+    colnames(err) = c('OASD','OAS', 'SS', 'RBLW','LW','s','OD','OB','OASB','MP','Oracle')
+    
+    # Generate samples from N(0,cov)
+    sample = mvrnorm(n, rep(0,p), cov)
+    
+    # Estimate the covariance matrix
+    scov = (t(sample) %*% sample)/nrow(sample)
+    f1 = (sum(diag(scov))/p)*diag(p)
+    f2 = diag(diag(scov))
+    tr_s = sum(diag(scov))
+    tr_s2 = sum(diag(t(scov) %*% scov))
+    tr_sdiag2 = sum(diag(diag(diag(scov)) %*% diag(diag(scov))))
+    
+    tr_t = sum(diag(cov))
+    tr_t2 = sum(diag(t(cov) %*% cov))
+    tr_tdiag2 = sum(diag(diag(diag(cov)) %*% diag(diag(cov))))
+    
+    scorr = cov2cor(scov)
+    tr_s_cor = sum(diag(scorr))
+    tr_s2_cor = sum(diag(t(scorr) %*% scorr))
+    f1_cor = (sum(diag(scorr))/p)*diag(p)
+    sample_sc = sample %*% (diag(diag(f2)^(-1/2)))
+    
+    # Method 2&3: LW & RBLW
+    num = 0
+    for (i in 1:n){
+      fill = sum((matrix(sample[i,],ncol=1) %*% matrix(sample[i,],nrow=1) - scov)^2)
+      num = num + fill
+    }
+    den = (n^2)*(tr_s2-(tr_s^2)/p)
+    rou_lw = num/den
+    rou_lw = min(rou_lw,1)
+    scov_lw = (1-rou_lw)*scov+rou_lw*f1
+
+    rou_rblw = (((n-2)/n)*tr_s2+tr_s^2)/((n+2)*(tr_s2-(tr_s^2)/p))
+    rou_rblw = min(rou_rblw,1)
+    scov_rblw = (1-rou_rblw)*scov+rou_rblw*f1
+    
+    # Method 4: oas_c
+    phi = (tr_s2-(tr_s^2)/p)/(tr_s^2+(1-2/p)*tr_s2)
+    rou_oas_constant = min(1/((n+1-2/p)*phi),1)
+    scov_oas_constant = (1-rou_oas_constant)*scov+rou_oas_constant*f1
+
+    # Method 5: oas_v
+    phi1 = (tr_s2-tr_sdiag2)/(tr_s2+tr_s^2-2*tr_sdiag2)
+    rou_oas_variant = min(1/((n+1)*phi1),1)
+    scov_oas_variant = (1-rou_oas_variant)*scov+rou_oas_variant*f2
+    
+    # Method 8: Shafer(applied to correlation matrix)
+    v <- (1/(n*(n - 1))) * (crossprod(sample_sc^2) - (1/n) * (crossprod(sample_sc))^2)
+    diag(v) <- 0
+    d <- (scorr - diag(diag(scorr)))^2
+    rou_ss <- sum(v)/sum(d)
+    rou_ss <- max(min(rou_ss, 1), 0)
+    scorr_ss = (1-rou_ss)*scorr+rou_ss*f1_cor
+    scov_ss = (f2^(1/2)) %*% scorr_ss %*% (f2^(1/2))
+    
+    # Method 9: Oracle_b
+    P = tr_tdiag2
+    R = tr_t2
+    Q = tr_t^2
+    
+    rou_b_o = (Q+R-2*P)/((n+1)*R+Q-(n+2)*P)
+    gamma_b_o = 1-(1/rou_b_o)*(((2/n)*P-(2/(n*p))*R)/(((n+2)/n)*P-(2/(n*p))*R-(1/p)*Q))
+    
+    scov_o_both = (1-rou_b_o)*scov+rou_b_o*(gamma_b_o*f2+(1-gamma_b_o)*f1)
+    
+    # Method 10: oas_b
+    theta = rou_oas_variant
+    A = (tr_s^2)/p
+    B = tr_s2-tr_sdiag2
+    C = tr_sdiag2-A
+    
+    t1 = ((p-1)*C)/((p-1)*(A+C)-B)
+    t2 = (B-(p-1)*C)/((p-1)*(A+C)-B)
+    t3 = (n*p*C)/(2*(p-1)*(A+C)-2*B)
+    
+    if (abs(t3/((t1+t2)*theta+1-t1))<1){
+      gamma_oas = (theta-1)/(theta)
+    }else{
+      gamma_oas = (theta*(t3-t2)-1)/(theta*(t1+t3))
+    }
+    
+    scov_oas_both = (1-theta)*scov+theta*(gamma_oas*f2+(1-gamma_oas)*f1)
+    
+    # Method 11: oracle_v
+    rou_o_variant = ((1/n)*tr_t2-(2/n)*tr_tdiag2+(1/n)*tr_t^2)/(((n+1)/n)*tr_t2+(1/n)*tr_t^2-((n+2)/n)*tr_tdiag2)
+    scov_o_variant = (1-rou_o_variant)*scov+rou_o_variant*f2
+     
+    # Method 12: sample analogue
+    rou_od = ((1/n)*tr_s2-(2/n)*tr_sdiag2+(1/n)*tr_s^2)/(((n+1)/n)*tr_s2+(1/n)*tr_s^2-((n+2)/n)*tr_sdiag2)
+    scov_od = (1-rou_od)*scov+rou_od*f2
+    
+    # Collect errors
+    err[1,'LW'] = get_err(solve(scov_lw),solve(cov))
+    err[1,'RBLW'] = get_err(solve(scov_rblw),solve(cov))
+    err[1,'SS'] = get_err(solve(scov_ss),solve(cov))
+    err[1,'OAS'] = get_err(solve(scov_oas_constant),solve(cov))
+    err[1,'OASD'] = get_err(solve(scov_oas_variant),solve(cov))
+    err[1,'s']=NA
+    err[1,'Oracle'] = get_err(solve(scov_o_variant),solve(cov))
+    err[1,'OB'] = get_err(solve(scov_o_both),solve(cov))
+    err[1,'OASB'] = get_err(solve(scov_oas_both),solve(cov))
+    err[1,'MP'] = get_err(ginv(scov),solve(cov))
+    err[1,'OD'] = get_err(solve(scov_od),solve(cov))
+    
+    return(err)
+  }
+  # res = map_dfr(seq(1,5000), sim_err) %>% mutate(large = large)
+  with_progress({
+  w = progressor(steps=length(seq(1,5000)))
+  res_sample_size = future_map_dfr(seq(1,5000), ~{
+    w()
+    sim_err(.x)
+    }, .options=furrr_options(seed=TRUE))
+})
+}
+res_sample_size = map_dfr(seq(large_min, large_max, 1),sim_diag,.progress=TRUE)
+saveRDS(res_sample_size, 'diag_inv.rds')
+# result = res_sample_size %>% group_by(large) %>% summarise(across(everything(), ~mean(.))) %>% ungroup() %>% mutate(across(-c(s,large,MP), ~(.data$MP-.)/.data$MP)*100)
+# result = pivot_longer(result,cols=!large,names_to='method',values_to ='MSE') %>% mutate(ours = ifelse(method %in% c('OASD','OASB'),TRUE,FALSE))
+# pl = ggplot(result %>% filter(!method %in% c('s','MP')), aes(x=large,y=MSE,group=method,color=method, linetype=ours))+geom_line()+scale_linetype_manual(values = c("TRUE" = "solid", "FALSE" = "dashed")) + xlab(TeX(r'($sd$)')) + guides(linetype = "none") + theme(
+#   text = element_text(size = 12),              # Global text size
+#   axis.title = element_text(size = 12),         # Axis titles
+#   axis.text = element_text(size = 12),          # Axis text
+#   plot.title = element_text(size = 12),         # Plot title
+#   legend.title = element_text(size = 12),       # Legend title
+#   legend.text = element_text(size = 12),         # Legend text
+#   legend.position = "bottom"
+# )
+# pl
+# ggsave('diag_inv.jpg', width = 6, height = 4)
+# res_sample_size = readRDS('diag_inv.rds')
+# # result = res_sample_size %>% group_by(large) %>% summarise(across(everything(), ~mean(.))) %>% ungroup() %>% mutate(across(-c(s,large), ~(.data$s-.)/.data$s)*100)
+# result_mean = res_sample_size %>% group_by(large) %>% summarise(across(everything(), ~mean(.))) %>% ungroup()
+# colnames(result_mean) = c('large',paste("mean", colnames(result_mean[,2:length(result_mean)]), sep = "_"))
+# result_sd = res_sample_size %>% group_by(large) %>% summarise(across(everything(), ~sd(.))) %>% ungroup()
+# colnames(result_sd) = paste("sd", colnames(result_sd), sep = "_")
+# result_tot = cbind(result_mean, result_sd[,2:ncol(result_sd)]) %>% 
+#   mutate(OASD_max = mean_OASD+1.96*(sd_OASD/sqrt(1000)),
+#          OAS_min = mean_OAS-1.96*(sd_OAS/sqrt(1000)),
+#          SS_min = mean_SS-1.96*(sd_SS/sqrt(1000)),
+#          RBLW_min = mean_RBLW-1.96*(sd_RBLW/sqrt(1000)),
+#          LW_min = mean_LW-1.96*(sd_LW/sqrt(1000)),
+#          s_min = mean_s-1.96*(sd_s/sqrt(1000)),
+#          OD_min = mean_OD-1.96*(sd_OD/sqrt(1000)),
+#          OB_min = mean_OB-1.96*(sd_OB/sqrt(1000)),
+#          OASB_min = mean_OASB-1.96*(sd_OASB/sqrt(1000)),
+#          Oracle_max = mean_Oracle+1.96*(sd_Oracle/sqrt(1000)),
+#          MP_min = mean_MP-1.96*(sd_MP/sqrt(1000)))
+# result_filtered = result_tot %>% select(large, OASD_max, OAS_min, SS_min, RBLW_min, LW_min, s_min,OD_min,OB_min,OASB_min, Oracle_max, MP_min) %>% mutate(across(-c(s_min,large), ~(.data$MP_min-.)/.data$MP_min)*100)
+# 
+# result_filtered = pivot_longer(result_filtered,cols=!large,names_to='method',values_to ='PRIAL')%>% mutate(ours = ifelse(method=='OASD',TRUE,FALSE))
+# pl = ggplot(result_filtered %>% filter(!method %in% c('s_min', 'RBLW_min','OB_min','OASB_min','MP_min')), aes(x=large,y=PRIAL,group=method,color=method, linetype=ours))+geom_line()+scale_linetype_manual(values = c("TRUE" = "solid", "FALSE" = "dashed")) + xlab(TeX(r'($sd$)')) + guides(linetype = "none") + theme(
+#   text = element_text(size = 12),              # Global text size
+#   axis.title = element_text(size = 12),         # Axis titles
+#   axis.text = element_text(size = 12),          # Axis text
+#   plot.title = element_text(size = 12),         # Plot title
+#   legend.title = element_text(size = 12),       # Legend title
+#   legend.text = element_text(size = 12),         # Legend text
+#   legend.position = "bottom"
+# )
+```
+
+```{r inv offdiag sparsity}
+large = 10
+n = 18
+
+sim_diag <- function(r){
+  
+  corr = matrix(0, ncol=p, nrow=p)
+  for (i in 1:p){
+    for (j in 1:p){
+      corr[i,j]=r^abs(i-j)
+    }
+  }
+  
+  sd = diag(c(rep(small,p/2),rep(large,p/2)))
+  cov = sd %*% corr %*% sd
+    
+  sim_err <- function(iter){
+
+    err = data.frame(matrix(nrow=1,ncol=11))
+    colnames(err) = c('OASD','OAS', 'SS', 'RBLW','LW','s','OD','OB','OASB','MP','Oracle')
+    
+    # Generate samples from N(0,cov)
+    sample = mvrnorm(n, rep(0,p), cov)
+    
+    # Estimate the covariance matrix
+    scov = (t(sample) %*% sample)/nrow(sample)
+    f1 = (sum(diag(scov))/p)*diag(p)
+    f2 = diag(diag(scov))
+    tr_s = sum(diag(scov))
+    tr_s2 = sum(diag(t(scov) %*% scov))
+    tr_sdiag2 = sum(diag(diag(diag(scov)) %*% diag(diag(scov))))
+    
+    tr_t = sum(diag(cov))
+    tr_t2 = sum(diag(t(cov) %*% cov))
+    tr_tdiag2 = sum(diag(diag(diag(cov)) %*% diag(diag(cov))))
+    
+    scorr = cov2cor(scov)
+    tr_s_cor = sum(diag(scorr))
+    tr_s2_cor = sum(diag(t(scorr) %*% scorr))
+    f1_cor = (sum(diag(scorr))/p)*diag(p)
+    sample_sc = sample %*% (diag(diag(f2)^(-1/2)))
+    
+    # Method 2&3: LW & RBLW
+    num = 0
+    for (i in 1:n){
+      fill = sum((matrix(sample[i,],ncol=1) %*% matrix(sample[i,],nrow=1) - scov)^2)
+      num = num + fill
+    }
+    den = (n^2)*(tr_s2-(tr_s^2)/p)
+    rou_lw = num/den
+    rou_lw = min(rou_lw,1)
+    scov_lw = (1-rou_lw)*scov+rou_lw*f1
+
+    rou_rblw = (((n-2)/n)*tr_s2+tr_s^2)/((n+2)*(tr_s2-(tr_s^2)/p))
+    rou_rblw = min(rou_rblw,1)
+    scov_rblw = (1-rou_rblw)*scov+rou_rblw*f1
+    
+    # Method 4: oas_c
+    phi = (tr_s2-(tr_s^2)/p)/(tr_s^2+(1-2/p)*tr_s2)
+    rou_oas_constant = min(1/((n+1-2/p)*phi),1)
+    scov_oas_constant = (1-rou_oas_constant)*scov+rou_oas_constant*f1
+
+    # Method 5: oas_v
+    phi1 = (tr_s2-tr_sdiag2)/(tr_s2+tr_s^2-2*tr_sdiag2)
+    rou_oas_variant = min(1/((n+1)*phi1),1)
+    scov_oas_variant = (1-rou_oas_variant)*scov+rou_oas_variant*f2
+    
+    # Method 8: Shafer(applied to correlation matrix)
+    v <- (1/(n*(n - 1))) * (crossprod(sample_sc^2) - (1/n) * (crossprod(sample_sc))^2)
+    diag(v) <- 0
+    d <- (scorr - diag(diag(scorr)))^2
+    rou_ss <- sum(v)/sum(d)
+    rou_ss <- max(min(rou_ss, 1), 0)
+    scorr_ss = (1-rou_ss)*scorr+rou_ss*f1_cor
+    scov_ss = (f2^(1/2)) %*% scorr_ss %*% (f2^(1/2))
+    
+    # Method 9: Oracle_v
+    rou_o_variant = ((1/n)*tr_t2-(2/n)*tr_tdiag2+(1/n)*tr_t^2)/(((n+1)/n)*tr_t2+(1/n)*tr_t^2-((n+2)/n)*tr_tdiag2)
+    scov_o_variant = (1-rou_o_variant)*scov+rou_o_variant*f2
+    
+    # Method 9: Oracle_b
+    P = tr_tdiag2
+    R = tr_t2
+    Q = tr_t^2
+    
+    rou_b_o = (Q+R-2*P)/((n+1)*R+Q-(n+2)*P)
+    gamma_b_o = 1-(1/rou_b_o)*(((2/n)*P-(2/(n*p))*R)/(((n+2)/n)*P-(2/(n*p))*R-(1/p)*Q))
+    
+    scov_o_both = (1-rou_b_o)*scov+rou_b_o*(gamma_b_o*f2+(1-gamma_b_o)*f1)
+    
+    # Method 10: oas_b
+    theta = rou_oas_variant
+    A = (tr_s^2)/p
+    B = tr_s2-tr_sdiag2
+    C = tr_sdiag2-A
+    
+    t1 = ((p-1)*C)/((p-1)*(A+C)-B)
+    t2 = (B-(p-1)*C)/((p-1)*(A+C)-B)
+    t3 = (n*p*C)/(2*(p-1)*(A+C)-2*B)
+    
+    if (abs(t3/((t1+t2)*theta+1-t1))<1){
+      gamma_oas = (theta-1)/(theta)
+    }else{
+      gamma_oas = (theta*(t3-t2)-1)/(theta*(t1+t3))
+    }
+    
+    scov_oas_both = (1-theta)*scov+theta*(gamma_oas*f2+(1-gamma_oas)*f1)
+    
+     # Method 12: sample analogue
+    rou_od = ((1/n)*tr_s2-(2/n)*tr_sdiag2+(1/n)*tr_s^2)/(((n+1)/n)*tr_s2+(1/n)*tr_s^2-((n+2)/n)*tr_sdiag2)
+    scov_od = (1-rou_od)*scov+rou_od*f2
+    
+    # Collect errors
+    err[1,'LW'] = get_err(solve(scov_lw),solve(cov))
+    err[1,'RBLW'] = get_err(solve(scov_rblw),solve(cov))
+    err[1,'SS'] = get_err(solve(scov_ss),solve(cov))
+    err[1,'OAS'] = get_err(solve(scov_oas_constant),solve(cov))
+    err[1,'OASD'] = get_err(solve(scov_oas_variant),solve(cov))
+    err[1,'s']=NA
+    err[1,'Oracle'] = get_err(solve(scov_o_variant),solve(cov))
+    err[1,'OB'] = get_err(solve(scov_o_both),solve(cov))
+    err[1,'OASB'] = get_err(solve(scov_oas_both),solve(cov))
+    err[1,'MP'] = get_err(ginv(scov),solve(cov))
+    err[1,'OD'] = get_err(ginv(scov_od),solve(cov))
+    
+    return(err)
+  }
+  res = map_dfr(seq(1,5000), sim_err) %>% mutate(r=r)
+}
+res_sample_size = map_dfr(seq(r_min, r_max, 0.1),sim_diag,.progress=TRUE)
+saveRDS(res_sample_size, 'r_inv.rds')
+# result = res_sample_size %>% group_by(r) %>% summarise(across(everything(), ~mean(.))) %>% ungroup() %>% mutate(across(-c(s,r,MP), ~(.data$MP-.)/.data$MP)*100)
+# result = pivot_longer(result,cols=!r,names_to='method',values_to ='MSE')%>% mutate(ours = ifelse(method %in% c('OASD','OASB'),TRUE,FALSE))
+# pl = ggplot(result %>% filter(!method %in% c('s', 'MP')), aes(x=r,y=MSE,group=method,color=method, linetype=ours))+geom_line()+scale_linetype_manual(values = c("TRUE" = "solid", "FALSE" = "dashed")) + xlab(TeX(r'($r$)')) + guides(linetype = "none") + theme(
+#   text = element_text(size = 12),              # Global text size
+#   axis.title = element_text(size = 12),         # Axis titles
+#   axis.text = element_text(size = 12),          # Axis text
+#   plot.title = element_text(size = 12),         # Plot title
+#   legend.title = element_text(size = 12),       # Legend title
+#   legend.text = element_text(size = 12),         # Legend text
+#   legend.position = "bottom"
+# )
+# ggplotly(pl)
+# ggsave('r_inv.jpg', width = 6, height = 4)
+# res_sample_size = readRDS('r_inv.rds')
+# result_mean = res_sample_size %>% group_by(r) %>% summarise(across(everything(), ~mean(.))) %>% ungroup()
+# colnames(result_mean) = c('r',paste("mean", colnames(result_mean[,2:length(result_mean)]), sep = "_"))
+# result_sd = res_sample_size %>% group_by(r) %>% summarise(across(everything(), ~sd(.))) %>% ungroup()
+# colnames(result_sd) = paste("sd", colnames(result_sd), sep = "_")
+# result_tot = cbind(result_mean, result_sd[,2:ncol(result_sd)]) %>% 
+#   mutate(OASD_max = mean_OASD+1.96*(sd_OASD/sqrt(1000)),
+#          OAS_min = mean_OAS-1.96*(sd_OAS/sqrt(1000)),
+#          SS_min = mean_SS-1.96*(sd_SS/sqrt(1000)),
+#          RBLW_min = mean_RBLW-1.96*(sd_RBLW/sqrt(1000)),
+#          LW_min = mean_LW-1.96*(sd_LW/sqrt(1000)),
+#          s_min = mean_s-1.96*(sd_s/sqrt(1000)),
+#          OD_min = mean_OD-1.96*(sd_OD/sqrt(1000)),
+#          OB_min = mean_OB-1.96*(sd_OB/sqrt(1000)),
+#          OASB_min = mean_OASB-1.96*(sd_OASB/sqrt(1000)),
+#          Oracle_max = mean_Oracle+1.96*(sd_Oracle/sqrt(1000)),
+#          MP_min = mean_MP-1.96*(sd_MP/sqrt(1000)))
+# result_filtered = result_tot %>% select(r, OASD_max, OAS_min, SS_min, RBLW_min, LW_min, s_min,OD_min,OB_min,OASB_min, Oracle_max,MP_min) %>% mutate(across(-c(s_min,r), ~(.data$MP_min-.)/.data$MP_min)*100)
+# 
+# result_filtered = pivot_longer(result_filtered,cols=!r,names_to='method',values_to ='PRIAL')%>% mutate(ours = ifelse(method=='OASD',TRUE,FALSE))
+# # result = res_sample_size %>% group_by(r) %>% summarise(across(everything(), ~mean(.))) %>% ungroup() %>% mutate(across(-c(s,r), ~(.data$s-.)/.data$s)*100)
+# # result = pivot_longer(result,cols=!r,names_to='method',values_to ='PRIAL')%>% mutate(ours = ifelse(method=='OASD',TRUE,FALSE))
+# pl = ggplot(result_filtered %>% filter(!method %in% c('s_min', 'RBLW_min','OB_min','OASB_min','MP_min')), aes(x=r,y=PRIAL,group=method,color=method, linetype=ours))+geom_line()+scale_linetype_manual(values = c("TRUE" = "solid", "FALSE" = "dashed")) + xlab(TeX(r'($r$)')) + guides(linetype = "none") + theme(
+# #   text = element_text(size = 12),              # Global text size
+# #   axis.title = element_text(size = 12),         # Axis titles
+# #   axis.text = element_text(size = 12),          # Axis text
+# #   plot.title = element_text(size = 12),         # Plot title
+# #   legend.title = element_text(size = 12),       # Legend title
+# #   legend.text = element_text(size = 12),         # Legend text
+# #   legend.position = "bottom"
+# # )
+```
+
+```{r inv sample size}
+small = 1
+large = 10
+r = 0.5
+
+corr = matrix(0, ncol=p, nrow=p)
+for (i in 1:p){
+  for (j in 1:p){
+    corr[i,j]=r^abs(i-j)
+  }
+}
+sd = diag(c(rep(small,p/2),rep(large,p/2)))
+cov = sd %*% corr %*% sd
+
+sim_diag <- function(n){
+    
+  sim_err <- function(iter){
+
+    err = data.frame(matrix(nrow=1,ncol=11))
+    colnames(err) = c('OASD','OAS', 'SS', 'RBLW','LW','s','OD','OB','OASB','MP','Oracle')
+    
+    # Generate samples from N(0,cov)
+    sample = mvrnorm(n, rep(0,p), cov)
+    
+    # Estimate the covariance matrix
+    scov = (t(sample) %*% sample)/nrow(sample)
+    f1 = (sum(diag(scov))/p)*diag(p)
+    f2 = diag(diag(scov))
+    tr_s = sum(diag(scov))
+    tr_s2 = sum(diag(t(scov) %*% scov))
+    tr_sdiag2 = sum(diag(diag(diag(scov)) %*% diag(diag(scov))))
+    
+    tr_t = sum(diag(cov))
+    tr_t2 = sum(diag(t(cov) %*% cov))
+    tr_tdiag2 = sum(diag(diag(diag(cov)) %*% diag(diag(cov))))
+    
+    scorr = cov2cor(scov)
+    tr_s_cor = sum(diag(scorr))
+    tr_s2_cor = sum(diag(t(scorr) %*% scorr))
+    f1_cor = (sum(diag(scorr))/p)*diag(p)
+    sample_sc = sample %*% (diag(diag(f2)^(-1/2)))
+    
+    # Method 2&3: LW & RBLW
+    num = 0
+    for (i in 1:n){
+      fill = sum((matrix(sample[i,],ncol=1) %*% matrix(sample[i,],nrow=1) - scov)^2)
+      num = num + fill
+    }
+    den = (n^2)*(tr_s2-(tr_s^2)/p)
+    rou_lw = num/den
+    rou_lw = min(rou_lw,1)
+    scov_lw = (1-rou_lw)*scov+rou_lw*f1
+
+    rou_rblw = (((n-2)/n)*tr_s2+tr_s^2)/((n+2)*(tr_s2-(tr_s^2)/p))
+    rou_rblw = min(rou_rblw,1)
+    scov_rblw = (1-rou_rblw)*scov+rou_rblw*f1
+    
+    # Method 4: oas_c
+    phi = (tr_s2-(tr_s^2)/p)/(tr_s^2+(1-2/p)*tr_s2)
+    rou_oas_constant = min(1/((n+1-2/p)*phi),1)
+    scov_oas_constant = (1-rou_oas_constant)*scov+rou_oas_constant*f1
+
+    # Method 5: oas_v
+    phi1 = (tr_s2-tr_sdiag2)/(tr_s2+tr_s^2-2*tr_sdiag2)
+    rou_oas_variant = min(1/((n+1)*phi1),1)
+    scov_oas_variant = (1-rou_oas_variant)*scov+rou_oas_variant*f2
+    
+    # Method 8: Shafer(applied to correlation matrix)
+    v <- (1/(n*(n - 1))) * (crossprod(sample_sc^2) - (1/n) * (crossprod(sample_sc))^2)
+    diag(v) <- 0
+    d <- (scorr - diag(diag(scorr)))^2
+    rou_ss <- sum(v)/sum(d)
+    rou_ss <- max(min(rou_ss, 1), 0)
+    scorr_ss = (1-rou_ss)*scorr+rou_ss*f1_cor
+    scov_ss = (f2^(1/2)) %*% scorr_ss %*% (f2^(1/2))
+    
+    # Method 9: Oracle_v
+    rou_o_variant = ((1/n)*tr_t2-(2/n)*tr_tdiag2+(1/n)*tr_t^2)/(((n+1)/n)*tr_t2+(1/n)*tr_t^2-((n+2)/n)*tr_tdiag2)
+    scov_o_variant = (1-rou_o_variant)*scov+rou_o_variant*f2
+    
+    # Method 9: Oracle_b
+    P = tr_tdiag2
+    R = tr_t2
+    Q = tr_t^2
+    
+    rou_b_o = (Q+R-2*P)/((n+1)*R+Q-(n+2)*P)
+    gamma_b_o = 1-(1/rou_b_o)*(((2/n)*P-(2/(n*p))*R)/(((n+2)/n)*P-(2/(n*p))*R-(1/p)*Q))
+    
+    scov_o_both = (1-rou_b_o)*scov+rou_b_o*(gamma_b_o*f2+(1-gamma_b_o)*f1)
+    
+    # Method 10: oas_b
+    theta = rou_oas_variant
+    A = (tr_s^2)/p
+    B = tr_s2-tr_sdiag2
+    C = tr_sdiag2-A
+    
+    t1 = ((p-1)*C)/((p-1)*(A+C)-B)
+    t2 = (B-(p-1)*C)/((p-1)*(A+C)-B)
+    t3 = (n*p*C)/(2*(p-1)*(A+C)-2*B)
+    
+    if (abs(t3/((t1+t2)*theta+1-t1))<1){
+      gamma_oas = (theta-1)/(theta)
+    }else{
+      gamma_oas = (theta*(t3-t2)-1)/(theta*(t1+t3))
+    }
+    
+    scov_oas_both = (1-theta)*scov+theta*(gamma_oas*f2+(1-gamma_oas)*f1)
+    
+     # Method 12: sample analogue
+    rou_od = ((1/n)*tr_s2-(2/n)*tr_sdiag2+(1/n)*tr_s^2)/(((n+1)/n)*tr_s2+(1/n)*tr_s^2-((n+2)/n)*tr_sdiag2)
+    scov_od = (1-rou_od)*scov+rou_od*f2
+    
+    # Collect errors
+    err[1,'LW'] = get_err(solve(scov_lw),solve(cov))
+    err[1,'RBLW'] = get_err(solve(scov_rblw),solve(cov))
+    err[1,'SS'] = get_err(solve(scov_ss),solve(cov))
+    err[1,'OAS'] = get_err(solve(scov_oas_constant),solve(cov))
+    err[1,'OASD'] = get_err(solve(scov_oas_variant),solve(cov))
+    err[1,'s']=NA
+    err[1,'Oracle'] = get_err(solve(scov_o_variant),solve(cov))
+    err[1,'OB'] = get_err(solve(scov_o_both),solve(cov))
+    err[1,'OASB'] = get_err(solve(scov_oas_both),solve(cov))
+    err[1,'MP'] = get_err(ginv(scov),solve(cov))
+    err[1,'OD'] = get_err(ginv(scov_od),solve(cov))
+    
+    return(err)
+  }
+  res = map_dfr(seq(1,1000), sim_err) %>% mutate(n=n)
+}
+res_sample_size = map_dfr(seq(n_min, n_max, 1),sim_diag,.progress=TRUE)
+saveRDS(res_sample_size, 'n_inv.rds')
+# result = res_sample_size %>% group_by(n) %>% summarise(across(everything(), ~mean(.))) %>% ungroup() %>% mutate(across(-c(s,n,MP), ~(.data$MP-.)/.data$MP)*100)
+# result = pivot_longer(result,cols=!n,names_to='method',values_to ='MSE')%>% mutate(ours = ifelse(method %in% c('OASD','OASB'),TRUE,FALSE))
+# pl = ggplot(result %>% filter(!method %in% c('s','MP')), aes(x=n,y=MSE,group=method,color=method, linetype=ours))+geom_line()+scale_linetype_manual(values = c("TRUE" = "solid", "FALSE" = "dashed")) + xlab(TeX(r'($n$)')) + guides(linetype = "none") + theme(
+#   text = element_text(size = 12),              # Global text size
+#   axis.title = element_text(size = 12),         # Axis titles
+#   axis.text = element_text(size = 12),          # Axis text
+#   plot.title = element_text(size = 12),         # Plot title
+#   legend.title = element_text(size = 12),       # Legend title
+#   legend.text = element_text(size = 12),         # Legend text
+#   legend.position = "bottom"
+# )
+# pl
+# ggsave('n_inv.jpg', width = 6, height = 4)
+res_sample_size = readRDS('n_inv.rds')
+result_mean = res_sample_size %>% group_by(n) %>% summarise(across(everything(), ~mean(.))) %>% ungroup()
+colnames(result_mean) = c('n',paste("mean", colnames(result_mean[,2:length(result_mean)]), sep = "_"))
+result_sd = res_sample_size %>% group_by(n) %>% summarise(across(everything(), ~sd(.))) %>% ungroup()
+colnames(result_sd) = paste("sd", colnames(result_sd), sep = "_")
+result_tot = cbind(result_mean, result_sd[,2:ncol(result_sd)]) %>% 
+  mutate(OASD_max = mean_OASD+1.96*(sd_OASD/sqrt(1000)),
+         OAS_min = mean_OAS-1.96*(sd_OAS/sqrt(1000)),
+         SS_min = mean_SS-1.96*(sd_SS/sqrt(1000)),
+         RBLW_min = mean_RBLW-1.96*(sd_RBLW/sqrt(1000)),
+         LW_min = mean_LW-1.96*(sd_LW/sqrt(1000)),
+         s_min = mean_s-1.96*(sd_s/sqrt(1000)),
+         OD_min = mean_OD-1.96*(sd_OD/sqrt(1000)),
+         OB_min = mean_OB-1.96*(sd_OB/sqrt(1000)),
+         OASB_min = mean_OASB-1.96*(sd_OASB/sqrt(1000)),
+         Oracle_max = mean_Oracle+1.96*(sd_Oracle/sqrt(1000)),
+         MP_min = mean_MP-1.96*(sd_MP/sqrt(1000)))
+result_filtered = result_tot %>% select(n, OASD_max, OAS_min, SS_min, RBLW_min, LW_min, s_min,OD_min,OB_min,OASB_min, Oracle_max,MP_min) %>% mutate(across(-c(s_min,n), ~(.data$MP_min-.)/.data$MP_min)*100)
+
+result_filtered = pivot_longer(result_filtered,cols=!n,names_to='method',values_to ='PRIAL')%>% mutate(ours = ifelse(method=='OASD',TRUE,FALSE))
+# result = res_sample_size %>% group_by(n) %>% summarise(across(everything(), ~mean(.))) %>% ungroup() %>% mutate(across(-c(s,n), ~(.data$s-.)/.data$s)*100)
+# result = pivot_longer(result,cols=!n,names_to='method',values_to ='PRIAL')%>% mutate(ours = ifelse(method=='OASD',TRUE,FALSE))
+pl = ggplot(result_filtered %>% filter(!method %in% c('s_min', 'RBLW_min','OB_min','OASB_min','MP_min')), aes(x=n,y=PRIAL,group=method,color=method, linetype=ours))+geom_line()+scale_linetype_manual(values = c("TRUE" = "solid", "FALSE" = "dashed")) + xlab(TeX(r'($n$)')) + guides(linetype = "none") + theme(
+  text = element_text(size = 12),              # Global text size
+  axis.title = element_text(size = 12),         # Axis titles
+  axis.text = element_text(size = 12),          # Axis text
+  plot.title = element_text(size = 12),         # Plot title
+  legend.title = element_text(size = 12),       # Legend title
+  legend.text = element_text(size = 12),         # Legend text
+  legend.position = "bottom"
+)
+```
+
+
+```{r diagonal scale difference -- non-normal}
+r = 0.5
+n = 18
+corr = matrix(0, ncol=p, nrow=p)
+for (i in 1:p){
+  for (j in 1:p){
+    corr[i,j]=r^abs(i-j)
+  }
+}
+
+sim_diag <- function(large){
+  
+  sd = diag(c(rep(small,p/2),rep(large,p/2)))
+  cov = sd %*% corr %*% sd
+    
+  sim_err <- function(iter){
+
+    err = data.frame(matrix(nrow=1,ncol=9))
+    colnames(err) = c('OASD','OAS', 'SS', 'RBLW','LW','s','OD','OB','OASB')
+    
+    # Generate samples from N(0,cov)
+    sample = rmvt(n, rep(0,p), cov)
+    
+    # Estimate the covariance matrix
+    scov = (t(sample) %*% sample)/nrow(sample)
+    f1 = (sum(diag(scov))/p)*diag(p)
+    f2 = diag(diag(scov))
+    tr_s = sum(diag(scov))
+    tr_s2 = sum(diag(t(scov) %*% scov))
+    tr_sdiag2 = sum(diag(diag(diag(scov)) %*% diag(diag(scov))))
+    
+    tr_t = sum(diag(cov))
+    tr_t2 = sum(diag(t(cov) %*% cov))
+    tr_tdiag2 = sum(diag(diag(diag(cov)) %*% diag(diag(cov))))
+    
+    scorr = cov2cor(scov)
+    tr_s_cor = sum(diag(scorr))
+    tr_s2_cor = sum(diag(t(scorr) %*% scorr))
+    f1_cor = (sum(diag(scorr))/p)*diag(p)
+    sample_sc = sample %*% (diag(diag(f2)^(-1/2)))
+    
+    # Method 2&3: LW & RBLW
+    num = 0
+    for (i in 1:n){
+      fill = sum((matrix(sample[i,],ncol=1) %*% matrix(sample[i,],nrow=1) - scov)^2)
+      num = num + fill
+    }
+    den = (n^2)*(tr_s2-(tr_s^2)/p)
+    rou_lw = num/den
+    rou_lw = min(rou_lw,1)
+    scov_lw = (1-rou_lw)*scov+rou_lw*f1
+
+    rou_rblw = (((n-2)/n)*tr_s2+tr_s^2)/((n+2)*(tr_s2-(tr_s^2)/p))
+    rou_rblw = min(rou_rblw,1)
+    scov_rblw = (1-rou_rblw)*scov+rou_rblw*f1
+    
+    # Method 4: oas_c
+    phi = (tr_s2-(tr_s^2)/p)/(tr_s^2+(1-2/p)*tr_s2)
+    rou_oas_constant = min(1/((n+1-2/p)*phi),1)
+    scov_oas_constant = (1-rou_oas_constant)*scov+rou_oas_constant*f1
+
+    # Method 5: oas_v
+    phi1 = (tr_s2-tr_sdiag2)/(tr_s2+tr_s^2-2*tr_sdiag2)
+    rou_oas_variant = min(1/((n+1)*phi1),1)
+    scov_oas_variant = (1-rou_oas_variant)*scov+rou_oas_variant*f2
+    
+    # Method 8: Shafer(applied to correlation matrix)
+    v <- (1/(n*(n - 1))) * (crossprod(sample_sc^2) - (1/n) * (crossprod(sample_sc))^2)
+    diag(v) <- 0
+    d <- (scorr - diag(diag(scorr)))^2
+    rou_ss <- sum(v)/sum(d)
+    rou_ss <- max(min(rou_ss, 1), 0)
+    scorr_ss = (1-rou_ss)*scorr+rou_ss*f1_cor
+    scov_ss = (f2^(1/2)) %*% scorr_ss %*% (f2^(1/2))
+    
+    # Method 9: Oracle_b
+    P = tr_tdiag2
+    R = tr_t2
+    Q = tr_t^2
+    
+    rou_b_o = (Q+R-2*P)/((n+1)*R+Q-(n+2)*P)
+    gamma_b_o = 1-(1/rou_b_o)*(((2/n)*P-(2/(n*p))*R)/(((n+2)/n)*P-(2/(n*p))*R-(1/p)*Q))
+    
+    scov_o_both = (1-rou_b_o)*scov+rou_b_o*(gamma_b_o*f2+(1-gamma_b_o)*f1)
+    
+    # Method 10: oas_b
+    theta = rou_oas_variant
+    A = (tr_s^2)/p
+    B = tr_s2-tr_sdiag2
+    C = tr_sdiag2-A
+    
+    t1 = ((p-1)*C)/((p-1)*(A+C)-B)
+    t2 = (B-(p-1)*C)/((p-1)*(A+C)-B)
+    t3 = (n*p*C)/(2*(p-1)*(A+C)-2*B)
+    
+    if (abs(t3/((t1+t2)*theta+1-t1))<1){
+      gamma_oas = (theta-1)/(theta)
+    }else{
+      gamma_oas = (theta*(t3-t2)-1)/(theta*(t1+t3))
+    }
+    
+    scov_oas_both = (1-theta)*scov+theta*(gamma_oas*f2+(1-gamma_oas)*f1)
+    
+    # Method 11: oracle_v
+    rou_o_variant = ((1/n)*tr_t2-(2/n)*tr_tdiag2+(1/n)*tr_t^2)/(((n+1)/n)*tr_t2+(1/n)*tr_t^2-((n+2)/n)*tr_tdiag2)
+    scov_o_variant = (1-rou_o_variant)*scov+rou_o_variant*f2
+    
+    # Collect errors
+    err[1,'LW'] = get_err(scov_lw,cov)
+    err[1,'RBLW'] = get_err(scov_rblw,cov)
+    err[1,'SS'] = get_err(scov_ss,cov)
+    err[1,'OAS'] = get_err(scov_oas_constant,cov)
+    err[1,'OASD'] = get_err(scov_oas_variant,cov)
+    err[1,'s']=sum((scov-cov)^2)
+    err[1,'OD'] = get_err(scov_o_variant,cov)
+    err[1,'OB'] = get_err(scov_o_both,cov)
+    err[1,'OASB'] = get_err(scov_oas_both,cov)
+    
+    return(err)
+  }
+  res = map_dfr(seq(1,1000), sim_err) %>% mutate(large = large)
+}
+res_sample_size = map_dfr(seq(large_min, large_max, 1),sim_diag,.progress=TRUE)
+saveRDS(res_sample_size, 'diag.rds')
+result = res_sample_size %>% group_by(large) %>% summarise(across(everything(), ~mean(.))) %>% ungroup() %>% mutate(across(-c(s,large), ~(.data$s-.)/.data$s)*100)
+result = pivot_longer(result,cols=!large,names_to='method',values_to ='PRIAL') %>% mutate(ours = ifelse(method %in% c('OASD','OASB'),TRUE,FALSE))
+pl = ggplot(result %>% filter(method != 's'), aes(x=large,y=PRIAL,group=method,color=method, linetype=ours))+geom_line()+scale_linetype_manual(values = c("TRUE" = "solid", "FALSE" = "dashed")) + xlab(TeX(r'($sd$)')) + guides(linetype = "none")
+ggplotly(pl)
+ggsave('diag.jpg')
+```
+
+```{r offdiag sparsity -- non-normal}
+large = 10
+n = 18
+
+sim_diag <- function(r){
+  
+  corr = matrix(0, ncol=p, nrow=p)
+  for (i in 1:p){
+    for (j in 1:p){
+      corr[i,j]=r^abs(i-j)
+    }
+  }
+  
+  sd = diag(c(rep(small,p/2),rep(large,p/2)))
+  cov = sd %*% corr %*% sd
+    
+  sim_err <- function(iter){
+
+    err = data.frame(matrix(nrow=1,ncol=9))
+    colnames(err) = c('OASD','OAS', 'SS', 'RBLW','LW','s','OD','OB','OASB')
+    
+    # Generate samples from N(0,cov)
+    sample = rmvt(n, rep(0,p), cov)
+    
+    # Estimate the covariance matrix
+    scov = (t(sample) %*% sample)/nrow(sample)
+    f1 = (sum(diag(scov))/p)*diag(p)
+    f2 = diag(diag(scov))
+    tr_s = sum(diag(scov))
+    tr_s2 = sum(diag(t(scov) %*% scov))
+    tr_sdiag2 = sum(diag(diag(diag(scov)) %*% diag(diag(scov))))
+    
+    tr_t = sum(diag(cov))
+    tr_t2 = sum(diag(t(cov) %*% cov))
+    tr_tdiag2 = sum(diag(diag(diag(cov)) %*% diag(diag(cov))))
+    
+    scorr = cov2cor(scov)
+    tr_s_cor = sum(diag(scorr))
+    tr_s2_cor = sum(diag(t(scorr) %*% scorr))
+    f1_cor = (sum(diag(scorr))/p)*diag(p)
+    sample_sc = sample %*% (diag(diag(f2)^(-1/2)))
+    
+    # Method 2&3: LW & RBLW
+    num = 0
+    for (i in 1:n){
+      fill = sum((matrix(sample[i,],ncol=1) %*% matrix(sample[i,],nrow=1) - scov)^2)
+      num = num + fill
+    }
+    den = (n^2)*(tr_s2-(tr_s^2)/p)
+    rou_lw = num/den
+    rou_lw = min(rou_lw,1)
+    scov_lw = (1-rou_lw)*scov+rou_lw*f1
+
+    rou_rblw = (((n-2)/n)*tr_s2+tr_s^2)/((n+2)*(tr_s2-(tr_s^2)/p))
+    rou_rblw = min(rou_rblw,1)
+    scov_rblw = (1-rou_rblw)*scov+rou_rblw*f1
+    
+    # Method 4: oas_c
+    phi = (tr_s2-(tr_s^2)/p)/(tr_s^2+(1-2/p)*tr_s2)
+    rou_oas_constant = min(1/((n+1-2/p)*phi),1)
+    scov_oas_constant = (1-rou_oas_constant)*scov+rou_oas_constant*f1
+
+    # Method 5: oas_v
+    phi1 = (tr_s2-tr_sdiag2)/(tr_s2+tr_s^2-2*tr_sdiag2)
+    rou_oas_variant = min(1/((n+1)*phi1),1)
+    scov_oas_variant = (1-rou_oas_variant)*scov+rou_oas_variant*f2
+    
+    # Method 8: Shafer(applied to correlation matrix)
+    v <- (1/(n*(n - 1))) * (crossprod(sample_sc^2) - (1/n) * (crossprod(sample_sc))^2)
+    diag(v) <- 0
+    d <- (scorr - diag(diag(scorr)))^2
+    rou_ss <- sum(v)/sum(d)
+    rou_ss <- max(min(rou_ss, 1), 0)
+    scorr_ss = (1-rou_ss)*scorr+rou_ss*f1_cor
+    scov_ss = (f2^(1/2)) %*% scorr_ss %*% (f2^(1/2))
+    
+    # Method 9: Oracle_v
+    rou_o_variant = ((1/n)*tr_t2-(2/n)*tr_tdiag2+(1/n)*tr_t^2)/(((n+1)/n)*tr_t2+(1/n)*tr_t^2-((n+2)/n)*tr_tdiag2)
+    scov_o_variant = (1-rou_o_variant)*scov+rou_o_variant*f2
+    
+    # Method 9: Oracle_b
+    P = tr_tdiag2
+    R = tr_t2
+    Q = tr_t^2
+    
+    rou_b_o = (Q+R-2*P)/((n+1)*R+Q-(n+2)*P)
+    gamma_b_o = 1-(1/rou_b_o)*(((2/n)*P-(2/(n*p))*R)/(((n+2)/n)*P-(2/(n*p))*R-(1/p)*Q))
+    
+    scov_o_both = (1-rou_b_o)*scov+rou_b_o*(gamma_b_o*f2+(1-gamma_b_o)*f1)
+    
+    # Method 10: oas_b
+    theta = rou_oas_variant
+    A = (tr_s^2)/p
+    B = tr_s2-tr_sdiag2
+    C = tr_sdiag2-A
+    
+    t1 = ((p-1)*C)/((p-1)*(A+C)-B)
+    t2 = (B-(p-1)*C)/((p-1)*(A+C)-B)
+    t3 = (n*p*C)/(2*(p-1)*(A+C)-2*B)
+    
+    if (abs(t3/((t1+t2)*theta+1-t1))<1){
+      gamma_oas = (theta-1)/(theta)
+    }else{
+      gamma_oas = (theta*(t3-t2)-1)/(theta*(t1+t3))
+    }
+    
+    scov_oas_both = (1-theta)*scov+theta*(gamma_oas*f2+(1-gamma_oas)*f1)
+    
+    
+    # Collect errors
+    err[1,'LW'] = get_err(scov_lw,cov)
+    err[1,'RBLW'] = get_err(scov_rblw,cov)
+    err[1,'SS'] = get_err(scov_ss,cov)
+    err[1,'OAS'] = get_err(scov_oas_constant,cov)
+    err[1,'OASD'] = get_err(scov_oas_variant,cov)
+    err[1,'s']=sum((scov-cov)^2)
+    err[1,'OD'] = get_err(scov_o_variant,cov)
+    err[1,'OB'] = get_err(scov_o_both,cov)
+    err[1,'OASB'] = get_err(scov_oas_both,cov)
+    
+    return(err)
+  }
+  res = map_dfr(seq(1,1000), sim_err) %>% mutate(r=r)
+}
+res_sample_size = map_dfr(seq(r_min, r_max, 0.1),sim_diag,.progress=TRUE)
+saveRDS(res_sample_size, 'r.rds')
+result = res_sample_size %>% group_by(r) %>% summarise(across(everything(), ~mean(.))) %>% ungroup() %>% mutate(across(-c(s,r), ~(.data$s-.)/.data$s)*100)
+result = pivot_longer(result,cols=!r,names_to='method',values_to ='PRIAL')%>% mutate(ours = ifelse(method %in% c('OASD','OASB'),TRUE,FALSE))
+pl = ggplot(result %>% filter(method != 's'), aes(x=r,y=PRIAL,group=method,color=method, linetype=ours))+geom_line()+scale_linetype_manual(values = c("TRUE" = "solid", "FALSE" = "dashed")) + xlab(TeX(r'($r$)')) + guides(linetype = "none")
+ggplotly(pl)
+ggsave('r.jpg')
+```
+
+```{r sample size -- non-normal}
+small = 1
+large = 10
+r = 0.5
+
+corr = matrix(0, ncol=p, nrow=p)
+for (i in 1:p){
+  for (j in 1:p){
+    corr[i,j]=r^abs(i-j)
+  }
+}
+sd = diag(c(rep(small,p/2),rep(large,p/2)))
+cov = sd %*% corr %*% sd
+
+sim_diag <- function(n){
+    
+  sim_err <- function(iter){
+
+    err = data.frame(matrix(nrow=1,ncol=9))
+    colnames(err) = c('OASD','OAS', 'SS', 'RBLW','LW','s','OD','OB','OASB')
+    
+    # Generate samples from N(0,cov)
+    sample = rmvt(n, rep(0,p), cov)
+    
+    # Estimate the covariance matrix
+    scov = (t(sample) %*% sample)/nrow(sample)
+    f1 = (sum(diag(scov))/p)*diag(p)
+    f2 = diag(diag(scov))
+    tr_s = sum(diag(scov))
+    tr_s2 = sum(diag(t(scov) %*% scov))
+    tr_sdiag2 = sum(diag(diag(diag(scov)) %*% diag(diag(scov))))
+    
+    tr_t = sum(diag(cov))
+    tr_t2 = sum(diag(t(cov) %*% cov))
+    tr_tdiag2 = sum(diag(diag(diag(cov)) %*% diag(diag(cov))))
+    
+    scorr = cov2cor(scov)
+    tr_s_cor = sum(diag(scorr))
+    tr_s2_cor = sum(diag(t(scorr) %*% scorr))
+    f1_cor = (sum(diag(scorr))/p)*diag(p)
+    sample_sc = sample %*% (diag(diag(f2)^(-1/2)))
+    
+    # Method 2&3: LW & RBLW
+    num = 0
+    for (i in 1:n){
+      fill = sum((matrix(sample[i,],ncol=1) %*% matrix(sample[i,],nrow=1) - scov)^2)
+      num = num + fill
+    }
+    den = (n^2)*(tr_s2-(tr_s^2)/p)
+    rou_lw = num/den
+    rou_lw = min(rou_lw,1)
+    scov_lw = (1-rou_lw)*scov+rou_lw*f1
+
+    rou_rblw = (((n-2)/n)*tr_s2+tr_s^2)/((n+2)*(tr_s2-(tr_s^2)/p))
+    rou_rblw = min(rou_rblw,1)
+    scov_rblw = (1-rou_rblw)*scov+rou_rblw*f1
+    
+    # Method 4: oas_c
+    phi = (tr_s2-(tr_s^2)/p)/(tr_s^2+(1-2/p)*tr_s2)
+    rou_oas_constant = min(1/((n+1-2/p)*phi),1)
+    scov_oas_constant = (1-rou_oas_constant)*scov+rou_oas_constant*f1
+
+    # Method 5: oas_v
+    phi1 = (tr_s2-tr_sdiag2)/(tr_s2+tr_s^2-2*tr_sdiag2)
+    rou_oas_variant = min(1/((n+1)*phi1),1)
+    scov_oas_variant = (1-rou_oas_variant)*scov+rou_oas_variant*f2
+    
+    # Method 8: Shafer(applied to correlation matrix)
+    v <- (1/(n*(n - 1))) * (crossprod(sample_sc^2) - (1/n) * (crossprod(sample_sc))^2)
+    diag(v) <- 0
+    d <- (scorr - diag(diag(scorr)))^2
+    rou_ss <- sum(v)/sum(d)
+    rou_ss <- max(min(rou_ss, 1), 0)
+    scorr_ss = (1-rou_ss)*scorr+rou_ss*f1_cor
+    scov_ss = (f2^(1/2)) %*% scorr_ss %*% (f2^(1/2))
+    
+    # Method 9: Oracle_v
+    rou_o_variant = ((1/n)*tr_t2-(2/n)*tr_tdiag2+(1/n)*tr_t^2)/(((n+1)/n)*tr_t2+(1/n)*tr_t^2-((n+2)/n)*tr_tdiag2)
+    scov_o_variant = (1-rou_o_variant)*scov+rou_o_variant*f2
+    
+    # Method 9: Oracle_b
+    P = tr_tdiag2
+    R = tr_t2
+    Q = tr_t^2
+    
+    rou_b_o = (Q+R-2*P)/((n+1)*R+Q-(n+2)*P)
+    gamma_b_o = 1-(1/rou_b_o)*(((2/n)*P-(2/(n*p))*R)/(((n+2)/n)*P-(2/(n*p))*R-(1/p)*Q))
+    
+    scov_o_both = (1-rou_b_o)*scov+rou_b_o*(gamma_b_o*f2+(1-gamma_b_o)*f1)
+    
+    # Method 10: oas_b
+    theta = rou_oas_variant
+    A = (tr_s^2)/p
+    B = tr_s2-tr_sdiag2
+    C = tr_sdiag2-A
+    
+    t1 = ((p-1)*C)/((p-1)*(A+C)-B)
+    t2 = (B-(p-1)*C)/((p-1)*(A+C)-B)
+    t3 = (n*p*C)/(2*(p-1)*(A+C)-2*B)
+    
+    if (abs(t3/((t1+t2)*theta+1-t1))<1){
+      gamma_oas = (theta-1)/(theta)
+    }else{
+      gamma_oas = (theta*(t3-t2)-1)/(theta*(t1+t3))
+    }
+    
+    scov_oas_both = (1-theta)*scov+theta*(gamma_oas*f2+(1-gamma_oas)*f1)
+    
+    
+    # Collect errors
+    err[1,'LW'] = get_err(scov_lw,cov)
+    err[1,'RBLW'] = get_err(scov_rblw,cov)
+    err[1,'SS'] = get_err(scov_ss,cov)
+    err[1,'OAS'] = get_err(scov_oas_constant,cov)
+    err[1,'OASD'] = get_err(scov_oas_variant,cov)
+    err[1,'s']=sum((scov-cov)^2)
+    err[1,'OD'] = get_err(scov_o_variant,cov)
+    err[1,'OB'] = get_err(scov_o_both,cov)
+    err[1,'OASB'] = get_err(scov_oas_both,cov)
+    
+    return(err)
+  }
+  res = map_dfr(seq(1,1000), sim_err) %>% mutate(n=n)
+}
+res_sample_size = map_dfr(seq(n_min, 100, 1),sim_diag,.progress=TRUE)
+# saveRDS(res_sample_size, 'n.rds')
+# result = res_sample_size %>% group_by(n) %>% summarise(across(everything(), ~mean(.))) %>% ungroup() %>% mutate(across(-c(s,n), ~(.data$s-.)/.data$s)*100)
+# result = pivot_longer(result,cols=!n,names_to='method',values_to ='PRIAL')%>% mutate(ours = ifelse(method %in% c('OASD','OASB'),TRUE,FALSE))
+# pl = ggplot(result %>% filter(method != 's'), aes(x=n,y=PRIAL,group=method,color=method, linetype=ours))+geom_line()+scale_linetype_manual(values = c("TRUE" = "solid", "FALSE" = "dashed")) + xlab(TeX(r'($n$)')) + guides(linetype = "none")
+# ggplotly(pl)
+# ggsave('n.jpg')
+```
+
+```{r rearranging plots}
+res_sample_size = readRDS('coef_large.rds')
+result = res_sample_size %>% group_by(large) %>% summarise(across(everything(), ~mean(.)))
+result = pivot_longer(result,cols=!large,names_to='method',values_to ='rho') %>% mutate(ours = ifelse(method %in% c('OASD','OASB'),TRUE,FALSE))
+p1 = ggplot(result %>% filter(!method %in% c('s')), aes(x=large,y=rho,group=method,color=method, linetype=ours))+geom_line()+scale_linetype_manual(values = c("TRUE" = "solid", "FALSE" = "dashed")) + xlab(TeX(r'($sd$)')) + ylab(TeX(r'(Shrinkage Parameter)'))+ guides(linetype = "none") + theme(
+  text = element_text(size = 12),              # Global text size
+  axis.title = element_text(size = 12),         # Axis titles
+  axis.text = element_text(size = 12),          # Axis text
+  plot.title = element_text(size = 12),         # Plot title
+  legend.title = element_text(size = 10),       # Legend title
+  legend.text = element_text(size = 10),
+  legend.position = "bottom", 
+  legend.box = "horizontal", 
+  legend.direction = "horizontal"
+)
+guide_plot <- get_legend(p1)
+p1 = p1 + theme(legend.position = 'none')
+res_sample_size = readRDS('diag.rds')
+result = res_sample_size %>% group_by(large) %>% summarise(across(everything(), ~mean(.))) %>% ungroup() %>% mutate(across(-c(s,large), ~(.data$s-.)/.data$s)*100)
+result = pivot_longer(result,cols=!large,names_to='method',values_to ='PRIAL') %>% mutate(ours = ifelse(method %in% c('OASD','OASB'),TRUE,FALSE))
+p2 = ggplot(result %>% filter(!method %in% c('s')), aes(x=large,y=PRIAL,group=method,color=method, linetype=ours))+geom_line()+scale_linetype_manual(values = c("TRUE" = "solid", "FALSE" = "dashed")) + xlab(TeX(r'($sd$)')) + guides(linetype = "none") + theme(
+  text = element_text(size = 12),              # Global text size
+  axis.title = element_text(size = 12),         # Axis titles
+  axis.text = element_text(size = 12),          # Axis text
+  plot.title = element_text(size = 12),         # Plot title
+  legend.title = element_text(size = 12),       # Legend title
+  legend.text = element_text(size = 12),         # Legend text
+  legend.position = "none"
+)
+
+combined_p = (p2 | p1)/guide_plot + 
+                 plot_layout(heights = c(1, 0.1))
+combined_p
+ggsave('large_mse+coef.jpg', width = 6, height = 4)
+
+res_sample_size = readRDS('coef_r.rds')
+result = res_sample_size %>% group_by(r) %>% summarise(across(everything(), ~mean(.)))
+result = pivot_longer(result,cols=!r,names_to='method',values_to ='rho') %>% mutate(ours = ifelse(method %in% c('OASD','OASB'),TRUE,FALSE))
+p1 = ggplot(result %>% filter(!method %in% c('s')), aes(x=r,y=rho,group=method,color=method, linetype=ours))+geom_line()+scale_linetype_manual(values = c("TRUE" = "solid", "FALSE" = "dashed")) + xlab(TeX(r'($\gamma$)')) + ylab(TeX(r'(Shrinkage Parameter)'))+ guides(linetype = "none") + theme(
+  text = element_text(size = 12),              # Global text size
+  axis.title = element_text(size = 12),         # Axis titles
+  axis.text = element_text(size = 12),          # Axis text
+  plot.title = element_text(size = 12),         # Plot title
+  legend.title = element_text(size = 10),       # Legend title
+  legend.text = element_text(size = 10),
+  legend.position = "bottom", 
+  legend.box = "horizontal", 
+  legend.direction = "horizontal"
+)
+
+guide_plot <- get_legend(p1)
+p1 = p1 + theme(legend.position = 'none')
+
+res_sample_size = readRDS('r.rds')
+result = res_sample_size %>% group_by(r) %>% summarise(across(everything(), ~mean(.))) %>% ungroup() %>% mutate(across(-c(s,r), ~(.data$s-.)/.data$s)*100)
+result = pivot_longer(result,cols=!r,names_to='method',values_to ='PRIAL') %>% mutate(ours = ifelse(method %in% c('OASD','OASB'),TRUE,FALSE))
+p2 = ggplot(result %>% filter(!method %in% c('s')), aes(x=r,y=PRIAL,group=method,color=method, linetype=ours))+geom_line()+scale_linetype_manual(values = c("TRUE" = "solid", "FALSE" = "dashed")) + xlab(TeX(r'($\gamma$)')) + guides(linetype = "none") + theme(
+  text = element_text(size = 12),              # Global text size
+  axis.title = element_text(size = 12),         # Axis titles
+  axis.text = element_text(size = 12),          # Axis text
+  plot.title = element_text(size = 12),         # Plot title
+  legend.title = element_text(size = 12),       # Legend title
+  legend.text = element_text(size = 12),         # Legend text
+  legend.position = "none"
+)
+# ggplotly(p2)
+
+combined_p = (p2 | p1)/guide_plot + 
+                 plot_layout(heights = c(1, 0.1))
+combined_p
+ggsave('r_mse+coef.jpg', width = 6, height = 4)
+
+res_sample_size = readRDS('coef_n.rds')
+result = res_sample_size %>% group_by(n) %>% summarise(across(everything(), ~mean(.)))
+result = pivot_longer(result,cols=!n,names_to='method',values_to ='rho') %>% mutate(ours = ifelse(method %in% c('OASD','OASB'),TRUE,FALSE))
+p1 = ggplot(result %>% filter(!method %in% c('s')), aes(x=n,y=rho,group=method,color=method, linetype=ours))+geom_line()+scale_linetype_manual(values = c("TRUE" = "solid", "FALSE" = "dashed")) + xlab(TeX(r'($n$)')) + ylab(TeX(r'(Shrinkage Parameter)'))+ guides(linetype = "none") + theme(
+  text = element_text(size = 12),              # Global text size
+  axis.title = element_text(size = 12),         # Axis titles
+  axis.text = element_text(size = 12),          # Axis text
+  plot.title = element_text(size = 12),         # Plot title
+  legend.title = element_text(size = 10),       # Legend title
+  legend.text = element_text(size = 10),
+  legend.position = "bottom", 
+  legend.box = "horizontal", 
+  legend.direction = "horizontal"
+)
+
+guide_plot <- get_legend(p1)
+p1 = p1 + theme(legend.position = 'none')
+
+res_sample_size = readRDS('n.rds')
+result = res_sample_size %>% group_by(n) %>% summarise(across(everything(), ~mean(.))) %>% ungroup() %>% mutate(across(-c(s,n), ~(.data$s-.)/.data$s)*100)
+result = pivot_longer(result,cols=!n,names_to='method',values_to ='PRIAL') %>% mutate(ours = ifelse(method %in% c('OASD','OASB'),TRUE,FALSE))
+p2 = ggplot(result %>% filter(!method %in% c('s')), aes(x=n,y=PRIAL,group=method,color=method, linetype=ours))+geom_line()+scale_linetype_manual(values = c("TRUE" = "solid", "FALSE" = "dashed")) + xlab(TeX(r'($n$)')) + guides(linetype = "none") + theme(
+  text = element_text(size = 12),              # Global text size
+  axis.title = element_text(size = 12),         # Axis titles
+  axis.text = element_text(size = 12),          # Axis text
+  plot.title = element_text(size = 12),         # Plot title
+  legend.title = element_text(size = 12),       # Legend title
+  legend.text = element_text(size = 12),         # Legend text
+  legend.position = "none"
+)
+
+combined_p = (p2 | p1)/guide_plot + 
+                 plot_layout(heights = c(1, 0.1))
+combined_p
+ggsave('n_mse+coef.jpg', width = 6, height = 4)
+
+res_sample_size = readRDS('coef_n*.rds')
+result = res_sample_size %>% group_by(n) %>% summarise(across(everything(), ~mean(.)))
+result = pivot_longer(result,cols=!n,names_to='method',values_to ='rho') %>% mutate(ours = ifelse(method %in% c('OASD','OASB'),TRUE,FALSE))
+p1 = ggplot(result %>% filter(!method %in% c('s')), aes(x=n,y=rho,group=method,color=method, linetype=ours))+geom_line()+scale_linetype_manual(values = c("TRUE" = "solid", "FALSE" = "dashed")) + xlab(TeX(r'($n$)')) + ylab(TeX(r'(Shrinkage Parameter)'))+ guides(linetype = "none") + theme(
+  text = element_text(size = 12),              # Global text size
+  axis.title = element_text(size = 12),         # Axis titles
+  axis.text = element_text(size = 12),          # Axis text
+  plot.title = element_text(size = 12),         # Plot title
+  legend.title = element_text(size = 10),       # Legend title
+  legend.text = element_text(size = 10),
+  legend.position = "bottom", 
+  legend.box = "horizontal", 
+  legend.direction = "horizontal"
+)
+
+guide_plot <- get_legend(p1)
+p1 = p1 + theme(legend.position = 'none')
+
+res_sample_size = readRDS('n*.rds')
+result = res_sample_size %>% group_by(n) %>% summarise(across(everything(), ~mean(.))) %>% ungroup() %>% mutate(across(-c(s,n), ~(.data$s-.)/.data$s)*100)
+result = pivot_longer(result,cols=!n,names_to='method',values_to ='PRIAL') %>% mutate(ours = ifelse(method %in% c('OASD','OASB'),TRUE,FALSE))
+p2 = ggplot(result %>% filter(!method %in% c('s')), aes(x=n,y=PRIAL,group=method,color=method, linetype=ours))+geom_line()+scale_linetype_manual(values = c("TRUE" = "solid", "FALSE" = "dashed")) + xlab(TeX(r'($n$)')) + guides(linetype = "none") + theme(
+  text = element_text(size = 12),              # Global text size
+  axis.title = element_text(size = 12),         # Axis titles
+  axis.text = element_text(size = 12),          # Axis text
+  plot.title = element_text(size = 12),         # Plot title
+  legend.title = element_text(size = 12),       # Legend title
+  legend.text = element_text(size = 12),         # Legend text
+  legend.position = "none"
+)
+
+combined_p = (p2 | p1)/guide_plot + 
+                 plot_layout(heights = c(1, 0.1))
+combined_p
+ggsave('n*_mse+coef.jpg', width = 6, height = 4)
+
+ggplotly(p2)
+```
+
+```{r rearranging plots iter}
+res_sample_size = readRDS('rho_converge.rds')
+result = res_sample_size[,c(1,seq(2,50,2))]
+colnames(result) = c('iteration',as.character(seq(n_min, n_max, 1)))
+result = result %>% pivot_longer(!iteration, names_to='n',values_to='MSE')
+result = result %>% mutate(color_iter = as.numeric(iteration), n=as.numeric(n))
+p1 = ggplot(result %>% mutate(MSE = sqrt(MSE)), aes(x=n,y=MSE,color=color_iter,group=iteration))+geom_line()+scale_color_gradient(low = "lightblue", high = "blue", breaks = c(1,5,10,15,20,25,30), name='Iterations',na.value = "red")+ylab(TeX(r'(RMSE of $\hat{rho}_j$)')) + theme(
+  text = element_text(size = 12),              # Global text size
+  axis.title = element_text(size = 12),         # Axis titles
+  axis.text = element_text(size = 12),          # Axis text
+  plot.title = element_text(size = 12),         # Plot title
+  legend.title = element_text(size = 10),       # Legend title
+  legend.text = element_text(size = 10),
+  legend.position = "bottom", 
+  legend.box = "horizontal", 
+  legend.direction = "horizontal"
+)
+guide_plot <- get_legend(p1)
+p1 = p1 + theme(legend.position = 'none')
+
+res_sample_size = readRDS('rho_converge_r.rds')
+result = res_sample_size[,c(1,seq(2,20,2))]
+colnames(result) = c('iteration',as.character(seq(r_min, r_max, 0.1)))
+result = result %>% pivot_longer(!iteration, names_to='r',values_to='MSE')
+result = result %>% mutate(color_iter = as.numeric(iteration), r=as.numeric(r))
+p2 = ggplot(result %>% mutate(MSE = sqrt(MSE)), aes(x=r,y=MSE,color=color_iter,group=iteration))+geom_line()+scale_color_gradient(low = "lightblue", high = "blue", breaks = c(1,3,5,7, 9), name='Iterations',na.value = "red")+ylab(TeX(r'(RMSE of $\hat{rho}_j$)')) + theme(
+  text = element_text(size = 12),              # Global text size
+  axis.title = element_text(size = 12),         # Axis titles
+  axis.text = element_text(size = 12),          # Axis text
+  plot.title = element_text(size = 12),         # Plot title
+  legend.title = element_text(size = 12),       # Legend title
+  legend.text = element_text(size = 12),         # Legend text
+  legend.position = "none"
+)
+p2 = p2 + theme(legend.position = 'none',axis.title.y = element_blank())
+
+res_sample_size = readRDS('rho_converge_large.rds')
+result = res_sample_size[,c(1,seq(2,20,2))]
+colnames(result) = c('iteration',as.character(seq(large_min, large_max, 1)))
+result = result %>% pivot_longer(!iteration, names_to='large',values_to='MSE')
+result = result %>% mutate(color_iter = as.numeric(iteration), large=as.numeric(large))
+p3 = ggplot(result %>% mutate(MSE = sqrt(MSE)), aes(x=large,y=MSE,color=color_iter,group=iteration))+geom_line()+scale_color_gradient(low = "lightblue", high = "blue", breaks = c(1,5,10,15,20,25,30), name='Iterations',na.value = "red")+ylab(TeX(r'(RMSE of $\hat{rho}_j$)'))+xlab(TeX(r'($sd$)')) + theme(
+  text = element_text(size = 12),              # Global text size
+  axis.title = element_text(size = 12),         # Axis titles
+  axis.text = element_text(size = 12),          # Axis text
+  plot.title = element_text(size = 12),         # Plot title
+  legend.title = element_text(size = 12),       # Legend title
+  legend.text = element_text(size = 12),         # Legend text
+  legend.position = "none",
+  axis.title.y = element_blank()
+)
+
+
+combined_p = (p1 | p2 | p3)/guide_plot + 
+                 plot_layout(heights = c(1, 0.1))
+combined_p
+ggsave('iter_tot.jpg', width = 6, height = 4)
+
+res_sample_size = readRDS('coef_r.rds')
+result = res_sample_size %>% group_by(r) %>% summarise(across(everything(), ~mean(.)))
+result = pivot_longer(result,cols=!r,names_to='method',values_to ='rho') %>% mutate(ours = ifelse(method %in% c('OASD','OASB'),TRUE,FALSE))
+p1 = ggplot(result %>% filter(!method %in% c('s')), aes(x=r,y=rho,group=method,color=method, linetype=ours))+geom_line()+scale_linetype_manual(values = c("TRUE" = "solid", "FALSE" = "dashed")) + xlab(TeX(r'($r$)')) + ylab(TeX(r'($\rho$)'))+ guides(linetype = "none") + theme(
+  text = element_text(size = 12),              # Global text size
+  axis.title = element_text(size = 12),         # Axis titles
+  axis.text = element_text(size = 12),          # Axis text
+  plot.title = element_text(size = 12),         # Plot title
+  legend.title = element_text(size = 10),       # Legend title
+  legend.text = element_text(size = 10),
+  legend.position = "bottom", 
+  legend.box = "horizontal", 
+  legend.direction = "horizontal"
+)
+
+guide_plot <- get_legend(p1)
+p1 = p1 + theme(legend.position = 'none')
+
+res_sample_size = readRDS('r.rds')
+result = res_sample_size %>% group_by(r) %>% summarise(across(everything(), ~mean(.))) %>% ungroup() %>% mutate(across(-c(s,r), ~(.data$s-.)/.data$s)*100)
+result = pivot_longer(result,cols=!r,names_to='method',values_to ='PRIAL') %>% mutate(ours = ifelse(method %in% c('OASD','OASB'),TRUE,FALSE))
+p2 = ggplot(result %>% filter(!method %in% c('s')), aes(x=r,y=PRIAL,group=method,color=method, linetype=ours))+geom_line()+scale_linetype_manual(values = c("TRUE" = "solid", "FALSE" = "dashed")) + xlab(TeX(r'($r$)')) + guides(linetype = "none") + theme(
+  text = element_text(size = 12),              # Global text size
+  axis.title = element_text(size = 12),         # Axis titles
+  axis.text = element_text(size = 12),          # Axis text
+  plot.title = element_text(size = 12),         # Plot title
+  legend.title = element_text(size = 12),       # Legend title
+  legend.text = element_text(size = 12),         # Legend text
+  legend.position = "none"
+)
+
+combined_p = (p2 | p1)/guide_plot + 
+                 plot_layout(heights = c(1, 0.1))
+combined_p
+ggsave('r_mse+coef.jpg', width = 6, height = 4)
+
+res_sample_size = readRDS('coef_n.rds')
+result = res_sample_size %>% group_by(n) %>% summarise(across(everything(), ~mean(.)))
+result = pivot_longer(result,cols=!n,names_to='method',values_to ='rho') %>% mutate(ours = ifelse(method %in% c('OASD','OASB'),TRUE,FALSE))
+p1 = ggplot(result %>% filter(!method %in% c('s')), aes(x=n,y=rho,group=method,color=method, linetype=ours))+geom_line()+scale_linetype_manual(values = c("TRUE" = "solid", "FALSE" = "dashed")) + xlab(TeX(r'($n$)')) + ylab(TeX(r'($\rho$)'))+ guides(linetype = "none") + theme(
+  text = element_text(size = 12),              # Global text size
+  axis.title = element_text(size = 12),         # Axis titles
+  axis.text = element_text(size = 12),          # Axis text
+  plot.title = element_text(size = 12),         # Plot title
+  legend.title = element_text(size = 10),       # Legend title
+  legend.text = element_text(size = 10),
+  legend.position = "bottom", 
+  legend.box = "horizontal", 
+  legend.direction = "horizontal"
+)
+
+guide_plot <- get_legend(p1)
+p1 = p1 + theme(legend.position = 'none')
+
+res_sample_size = readRDS('n.rds')
+result = res_sample_size %>% group_by(n) %>% summarise(across(everything(), ~mean(.))) %>% ungroup() %>% mutate(across(-c(s,n), ~(.data$s-.)/.data$s)*100)
+result = pivot_longer(result,cols=!n,names_to='method',values_to ='PRIAL') %>% mutate(ours = ifelse(method %in% c('OASD','OASB'),TRUE,FALSE))
+p2 = ggplot(result %>% filter(!method %in% c('s')), aes(x=n,y=PRIAL,group=method,color=method, linetype=ours))+geom_line()+scale_linetype_manual(values = c("TRUE" = "solid", "FALSE" = "dashed")) + xlab(TeX(r'($n$)')) + guides(linetype = "none") + theme(
+  text = element_text(size = 12),              # Global text size
+  axis.title = element_text(size = 12),         # Axis titles
+  axis.text = element_text(size = 12),          # Axis text
+  plot.title = element_text(size = 12),         # Plot title
+  legend.title = element_text(size = 12),       # Legend title
+  legend.text = element_text(size = 12),         # Legend text
+  legend.position = "none"
+)
+
+combined_p = (p2 | p1)/guide_plot + 
+                 plot_layout(heights = c(1, 0.1))
+combined_p
+ggsave('n_mse+coef.jpg', width = 6, height = 4)
+
+```
+
+```{r rearranging plots for inv}
+res_sample_size = readRDS('diag_inv.rds')
+result = res_sample_size %>% group_by(large) %>% summarise(across(everything(), ~mean(.))) %>% ungroup() %>% mutate(across(-c(s,large,MP), ~(.data$MP-.)/.data$MP)*100)
+result = pivot_longer(result,cols=!large,names_to='method',values_to ='MSE') %>% mutate(ours = ifelse(method %in% c('OASD','OASB'),TRUE,FALSE))
+p1 = ggplot(result %>% filter(!method %in% c('s', 'MP','OASB','RBLW','OB')), aes(x=large,y=MSE,group=method,color=method, linetype=ours))+geom_line(data = result %>% filter(!method %in% c('s','OASB','RBLW','OB','Oracle','MP'))) + geom_line(data=result %>% filter(method=='Oracle'),color='black',show.legend=FALSE)+scale_linetype_manual(values = c("TRUE" = "solid", "FALSE" = "dashed"))+scale_color_manual(values = c("Oracle" = "black","OAS" = "blue","OD"="orange","OAS"="green","LW"="brown","SS"="purple","OASD"="red"),labels=c("LW"=TeX(r'($italic(LW)$)'), "OAS"=TeX(r'($italic(OAS)$)'), "OASD"=TeX(r'($italic(OASD)$)'), "OD"=TeX(r'($italic(OD)$)'), "SS"=TeX(r'($italic(SS)$)')))+ xlab(TeX(r'($italic(sd)$)')) + ylab(TeX(r'($italic(PRIAL)_{italic(INV)}$)')) + guides(linetype = "none") + theme(
+  text = element_text(size = 12),              # Global text size
+  axis.title = element_text(size = 12),         # Axis titles
+  axis.text = element_text(size = 12),          # Axis text
+  plot.title = element_text(size = 12),         # Plot title
+  legend.title = element_text(size = 12, face='italic'),       # Legend title
+  legend.text = element_text(size = 12, face='italic'),         # Legend text
+  legend.position = "bottom"
+)
+guide_plot <- get_legend(p1)
+p1 = p1 + theme(legend.position = 'none')
+
+res_sample_size = readRDS('r_inv.rds')
+result = res_sample_size %>% group_by(r) %>% summarise(across(everything(), ~mean(.))) %>% ungroup() %>% mutate(across(-c(s,r,MP), ~(.data$MP-.)/.data$MP)*100)
+result = pivot_longer(result,cols=!r,names_to='method',values_to ='MSE')%>% mutate(ours = ifelse(method %in% c('OASD','OASB'),TRUE,FALSE))
+p2 = ggplot(result %>% filter(!(method %in% c('s', 'MP','OASB','RBLW','OB'))), aes(x=r,y=MSE,group=method,color=method, linetype=ours))+geom_line() + geom_line(data=result %>% filter(method=='Oracle'),color='black',show.legend=FALSE)+scale_linetype_manual(values = c("TRUE" = "solid", "FALSE" = "dashed"))+scale_color_manual(values = c("Oracle" = "black","OAS" = "blue","OD"="orange","OAS"="green","LW"="brown","SS"="purple","OASD"="red"),labels=c("LW"=TeX(r'($LW$)'), "OAS"=TeX(r'($OAS$)'), "OASD"=TeX(r'($OASD$)'), "OD"=TeX(r'($OD$)'), "SS"=TeX(r'($SS$)'))) + xlab(TeX(r'($\gamma$)')) + ylab(TeX(r'($PRIAL_{INV}$)')) + guides(linetype = "none") + theme(
+  text = element_text(size = 12),              # Global text size
+  axis.title = element_text(size = 12),         # Axis titles
+  axis.text = element_text(size = 12),          # Axis text
+  plot.title = element_text(size = 12),         # Plot title
+  legend.title = element_text(size = 12),       # Legend title
+  legend.text = element_text(size = 12),         # Legend text
+  legend.position = "bottom"
+)
+p2 = p2 + theme(legend.position = 'none',axis.title.y = element_blank())
+
+res_sample_size = readRDS('n_inv.rds')
+result = res_sample_size %>% group_by(n) %>% summarise(across(everything(), ~mean(.))) %>% ungroup() %>% mutate(across(-c(s,n,MP), ~(.data$MP-.)/.data$MP)*100)
+result = pivot_longer(result,cols=!n,names_to='method',values_to ='MSE')%>% mutate(ours = ifelse(method %in% c('OASD','OASB'),TRUE,FALSE))
+p3 = ggplot(result %>% filter(!(method %in% c('s', 'MP','OASB','RBLW','OB'))), aes(x=n,y=MSE,group=method,color=method, linetype=ours))+geom_line() + geom_line(data=result %>% filter(method=='Oracle'),color='black',show.legend=FALSE)+scale_linetype_manual(values = c("TRUE" = "solid", "FALSE" = "dashed"))+scale_color_manual(values = c("Oracle" = "black","OAS" = "blue","OD"="orange","OAS"="green","LW"="brown","SS"="purple","OASD"="red"),labels=c("LW"=TeX(r'($LW$)'), "OAS"=TeX(r'($OAS$)'), "OASD"=TeX(r'($OASD$)'), "OD"=TeX(r'($OD$)'), "SS"=TeX(r'($SS$)'))) + xlab(TeX(r'($italic(n)$)')) + ylab(TeX(r'($PRIAL_{INV}$)')) + guides(linetype = "none") + theme(
+  text = element_text(size = 12),              # Global text size
+  axis.title = element_text(size = 12),         # Axis titles
+  axis.text = element_text(size = 12),          # Axis text
+  plot.title = element_text(size = 12),         # Plot title
+  legend.title = element_text(size = 12),       # Legend title
+  legend.text = element_text(size = 12),         # Legend text
+  legend.position = "bottom"
+)
+p3 = p3 + theme(legend.position = 'none',axis.title.y = element_blank())
+
+combined_p = (p1 | p2 | p3)/guide_plot + 
+                 plot_layout(heights = c(1, 0.1))
+combined_p
+ggsave('inv_tot.jpg', width = 6, height = 4)
+```
+
+```{r rearranging plots for the corr}
+res_sample_size = readRDS('diag_corr_5000.rds')
+result = res_sample_size %>% group_by(large) %>% summarise(across(everything(), ~mean(.))) %>% ungroup() %>% mutate(across(-c(s,large), ~(.data$s-.)/.data$s)*100)
+result = pivot_longer(result,cols=!large,names_to='method',values_to ='PRIAL')%>% mutate(ours = ifelse(method %in% c('OASD','OASB'),TRUE,FALSE))
+p1 = ggplot(result %>% filter(!method %in% c('s','OD')), aes(x=large,y=PRIAL,group=method,color=method, linetype=ours))+geom_line(data = result %>% filter(!method %in% c('s','OASB','RBLW','OB','Oracle','OD'))) + geom_line(data=result %>% filter(method=='Oracle'),color='black',show.legend=FALSE)+scale_linetype_manual(values = c("TRUE" = "solid", "FALSE" = "dashed"))+scale_linetype_manual(values = c("TRUE" = "solid", "FALSE" = "dashed"))+scale_color_manual(values = c("Oracle" = "black","OAS" = "blue","OD"="orange","OAS"="green","LW"="brown","SS"="purple","OASD"="red"),labels=c("LW"=TeX(r'($italic(LW)_{italic(corr)}$)'), "OAS"=TeX(r'($italic(OAS)_{italic(corr)}$)'), "OASD"=TeX(r'($italic(OASD)$)'), "OD"=TeX(r'($italic(OD)$)'), "SS"=TeX(r'($italic(SS)$)')))+ xlab(TeX(r'($italic(sd)$)')) + ylab(TeX(r'($italic(PRIAL)$)')) + guides(linetype = "none") + theme(
+  text = element_text(size = 12),              # Global text size
+  axis.title = element_text(size = 12),         # Axis titles
+  axis.text = element_text(size = 12),          # Axis text
+  plot.title = element_text(size = 12),         # Plot title
+  legend.title = element_text(size = 12, face='italic'),       # Legend title
+  legend.text = element_text(size = 12, face='italic'),         # Legend text
+  legend.position = "bottom"
+)
+guide_plot <- get_legend(p1)
+p1 = p1 + theme(legend.position = 'none')
+
+res_sample_size = readRDS('r_corr.rds')
+result = res_sample_size %>% group_by(r) %>% summarise(across(everything(), ~mean(.))) %>% ungroup() %>% mutate(across(-c(s,r), ~(.data$s-.)/.data$s)*100)
+result = pivot_longer(result,cols=!r,names_to='method',values_to ='PRIAL')%>% mutate(ours = ifelse(method %in% c('OASD','OASB'),TRUE,FALSE))
+p2 = ggplot(result %>% filter(!method %in% c('s','OD')), aes(x=r,y=PRIAL,group=method,color=method, linetype=ours))+geom_line(data = result %>% filter(!method %in% c('s','OASB','RBLW','OB','Oracle','OD'))) + geom_line(data=result %>% filter(method=='Oracle'),color='black',show.legend=FALSE)+scale_linetype_manual(values = c("TRUE" = "solid", "FALSE" = "dashed"))+scale_color_manual(values = c("Oracle" = "black","OAS" = "blue","OD"="orange","OAS"="green","LW"="brown","SS"="purple","OASD"="red"),labels=c("LW"=TeX(r'($italic(LW)_{italic(corr)}$)'), "OAS"=TeX(r'($italic(OAS)_{italic(corr)}$)'), "OASD"=TeX(r'($OASD$)'), "OD"=TeX(r'($OD$)'), "SS"=TeX(r'($SS$)'))) + xlab(TeX(r'($\gamma$)')) + guides(linetype = "none") + theme(
+  text = element_text(size = 12),              # Global text size
+  axis.title = element_text(size = 12),         # Axis titles
+  axis.text = element_text(size = 12),          # Axis text
+  plot.title = element_text(size = 12),         # Plot title
+  legend.title = element_text(size = 12),       # Legend title
+  legend.text = element_text(size = 12),         # Legend text
+  legend.position = "bottom"
+)
+p2 = p2 + theme(legend.position = 'none',axis.title.y = element_blank())
+
+res_sample_size = readRDS('n_corr_5000.rds')
+result = res_sample_size %>% group_by(n) %>% summarise(across(everything(), ~mean(.))) %>% ungroup() %>% mutate(across(-c(s,n), ~(.data$s-.)/.data$s)*100)
+result = pivot_longer(result,cols=!n,names_to='method',values_to ='PRIAL')%>% mutate(ours = ifelse(method %in% c('OASD','OASB'),TRUE,FALSE))
+p3 = ggplot(result %>% filter(!method %in% c('s','OD')), aes(x=n,y=PRIAL,group=method,color=method, linetype=ours))+geom_line(data = result %>% filter(!method %in% c('s','OASB','RBLW','OB','Oracle','OD'))) + geom_line(data=result %>% filter(method=='Oracle'),color='black',show.legend=FALSE)+scale_linetype_manual(values = c("TRUE" = "solid", "FALSE" = "dashed"))+scale_color_manual(values = c("Oracle" = "black","OAS" = "blue","OD"="orange","OAS"="green","LW"="brown","SS"="purple","OASD"="red"),labels=c("LW"=TeX(r'($italic(LW)_{italic(corr)}$)'), "OAS"=TeX(r'($italic(OAS)_{italic(corr)}$)'), "OASD"=TeX(r'($OASD$)'), "OD"=TeX(r'($OD$)'), "SS"=TeX(r'($SS$)'))) + xlab(TeX(r'($italic(n)$)')) + guides(linetype = "none") + theme(
+  text = element_text(size = 12),              # Global text size
+  axis.title = element_text(size = 12),         # Axis titles
+  axis.text = element_text(size = 12),          # Axis text
+  plot.title = element_text(size = 12),         # Plot title
+  legend.title = element_text(size = 12),       # Legend title
+  legend.text = element_text(size = 12),         # Legend text
+  legend.position = "bottom"
+)
+p3 = p3 + theme(legend.position = 'none',axis.title.y = element_blank())
+
+combined_p = (p1 | p2 | p3)/guide_plot + 
+                 plot_layout(heights = c(1, 0.1))
+combined_p
+ggsave('corr_tot.jpg', width = 6, height = 4)
+```
+
+```{r rearranging plots one target paper}
+res_sample_size = readRDS('coef_large.rds')
+result = res_sample_size %>% group_by(large) %>% summarise(across(everything(), ~mean(.)))
+result = pivot_longer(result,cols=!large,names_to='method',values_to ='rho') %>% mutate(ours = ifelse(method %in% c('OASD','OASB'),TRUE,FALSE))
+p1 = ggplot(result %>% filter(!method %in% c('s','OASB','RBLW','OB')), aes(x=large,y=rho,group=method,color=method, linetype=ours))+geom_line(data = result %>% filter(!method %in% c('s','OASB','RBLW','OB','Oracle'))) + geom_line(data=result %>% filter(method=='Oracle'),color='black',show.legend=FALSE)+scale_linetype_manual(values = c("TRUE" = "solid", "FALSE" = "dashed"))+scale_color_manual(values = c("Oracle" = "black","OAS" = "blue","OD"="orange","OAS"="green","LW"="brown","SS"="purple","OASD"="red"),labels=c("LW"=TeX(r'($italic(LW)$)'), "OAS"=TeX(r'($italic(OAS)$)'), "OASD"=TeX(r'($italic(OASD)$)'), "OD"=TeX(r'($italic(OD)$)'), "SS"=TeX(r'($italic(SS)$)')))+ xlab(TeX(r'($italic(sd)$)')) + ylab(TeX(r'($italic(Average)$ $\rho$)'))+ guides(linetype = "none") + theme(
+  text = element_text(size = 12),              # Global text size
+  axis.title = element_text(size = 12),         # Axis titles
+  axis.text = element_text(size = 12),          # Axis text
+  plot.title = element_text(size = 12),         # Plot title
+  legend.title = element_text(size = 10, face="italic"),       # Legend title
+  legend.text = element_text(size = 10),
+  legend.position = "bottom", 
+  legend.box = "horizontal", 
+  legend.direction = "horizontal"
+)
+guide_plot <- get_legend(p1)
+p1 = p1 + theme(legend.position = 'none')
+res_sample_size = readRDS('diag.rds')
+result = res_sample_size %>% group_by(large) %>% summarise(across(everything(), ~mean(.))) %>% ungroup() %>% mutate(across(-c(s,large), ~(.data$s-.)/.data$s)*100)
+result = pivot_longer(result,cols=!large,names_to='method',values_to ='PRIAL') %>% mutate(ours = ifelse(method %in% c('OASD','OASB'),TRUE,FALSE))
+p2 = ggplot(result %>% filter(!method %in% c('s','OASB','RBLW','OB')), aes(x=large,y=PRIAL,group=method,color=method, linetype=ours))+geom_line(data = result %>% filter(!method %in% c('s','OASB','RBLW','OB','Oracle'))) + geom_line(data=result %>% filter(method=='Oracle'),color='black',show.legend=FALSE)+scale_linetype_manual(values = c("TRUE" = "solid", "FALSE" = "dashed"))+scale_color_manual(values = c("Oracle" = "black","OAS" = "blue","OD"="orange","OAS"="green","LW"="brown","SS"="purple","OASD"="red"),labels=c("LW"=TeX(r'($italic(LW)$)'), "OAS"=TeX(r'($italic(OAS)$)'), "OASD"=TeX(r'($italic(OASD)$)'), "OD"=TeX(r'($italic(OD)$)'), "SS"=TeX(r'($italic(SS)$)')))+ xlab(TeX(r'($italic(sd)$)')) + ylab(TeX(r'($italic(PRIAL)$)')) + guides(linetype = "none") + theme(
+  text = element_text(size = 12),              # Global text size
+  axis.title = element_text(size = 12),         # Axis titles
+  axis.text = element_text(size = 12),          # Axis text
+  plot.title = element_text(size = 12),         # Plot title
+  legend.title = element_text(size = 12),       # Legend title
+  legend.text = element_text(size = 12),         # Legend text
+  legend.position = "none"
+)
+
+combined_p = (p2 | p1)/guide_plot + 
+                 plot_layout(heights = c(1, 0.1))
+combined_p
+ggsave('large_mse+coef.jpg', width = 6, height = 4)
+
+res_sample_size = readRDS('coef_r.rds')
+result = res_sample_size %>% group_by(r) %>% summarise(across(everything(), ~mean(.)))
+result = pivot_longer(result,cols=!r,names_to='method',values_to ='rho') %>% mutate(ours = ifelse(method %in% c('OASD','OASB'),TRUE,FALSE))
+p1 = ggplot(result %>% filter(!method %in% c('s','OASB','RBLW','OB')), aes(x=r,y=rho,group=method,color=method, linetype=ours))+geom_line(data = result %>% filter(!method %in% c('s','OASB','RBLW','OB','Oracle'))) + geom_line(data=result %>% filter(method=='Oracle'),color='black',show.legend=FALSE)+scale_linetype_manual(values = c("TRUE" = "solid", "FALSE" = "dashed"))+scale_color_manual(values = c("Oracle" = "black","OAS" = "blue","OD"="orange","OAS"="green","LW"="brown","SS"="purple","OASD"="red"),labels=c("LW"=TeX(r'($italic(LW)$)'), "OAS"=TeX(r'($italic(OAS)$)'), "OASD"=TeX(r'($italic(OASD)$)'), "OD"=TeX(r'($italic(OD)$)'), "SS"=TeX(r'($italic(SS)$)')))+ xlab(TeX(r'($\gamma$)')) + ylab(TeX(r'($italic(Average)$ $\rho$)'))+ guides(linetype = "none") + theme(
+  text = element_text(size = 12),              # Global text size
+  axis.title = element_text(size = 12),         # Axis titles
+  axis.text = element_text(size = 12),          # Axis text
+  plot.title = element_text(size = 12),         # Plot title
+  legend.title = element_text(size = 10, face="italic"),       # Legend title
+  legend.text = element_text(size = 10),
+  legend.position = "bottom", 
+  legend.box = "horizontal", 
+  legend.direction = "horizontal"
+)
+
+guide_plot <- get_legend(p1)
+p1 = p1 + theme(legend.position = 'none')
+
+res_sample_size = readRDS('r.rds')
+result = res_sample_size %>% group_by(r) %>% summarise(across(everything(), ~mean(.))) %>% ungroup() %>% mutate(across(-c(s,r), ~(.data$s-.)/.data$s)*100)
+result = pivot_longer(result,cols=!r,names_to='method',values_to ='PRIAL') %>% mutate(ours = ifelse(method %in% c('OASD','OASB'),TRUE,FALSE))
+p2 = ggplot(result %>% filter(!method %in% c('s','OASB','RBLW','OB')), aes(x=r,y=PRIAL,group=method,color=method, linetype=ours))+geom_line(data = result %>% filter(!method %in% c('s','OASB','RBLW','OB','Oracle'))) + geom_line(data=result %>% filter(method=='Oracle'),color='black',show.legend=FALSE)+scale_linetype_manual(values = c("TRUE" = "solid", "FALSE" = "dashed"))+scale_color_manual(values = c("Oracle" = "black","OAS" = "blue","OD"="orange","OAS"="green","LW"="brown","SS"="purple","OASD"="red"),labels=c("LW"=TeX(r'($LW$)'), "OAS"=TeX(r'($OAS$)'), "OASD"=TeX(r'($OASD$)'), "OD"=TeX(r'($OD$)'), "SS"=TeX(r'($SS$)'))) + xlab(TeX(r'($\gamma$)')) + ylab(TeX(r'($italic(PRIAL)$)')) + guides(linetype = "none") + theme(
+  text = element_text(size = 12),              # Global text size
+  axis.title = element_text(size = 12),         # Axis titles
+  axis.text = element_text(size = 12),          # Axis text
+  plot.title = element_text(size = 12),         # Plot title
+  legend.title = element_text(size = 12),       # Legend title
+  legend.text = element_text(size = 12),         # Legend text
+  legend.position = "none"
+)
+# ggplotly(p2)
+
+combined_p = (p2 | p1)/guide_plot + 
+                 plot_layout(heights = c(1, 0.1))
+combined_p
+ggsave('r_mse+coef.jpg', width = 6, height = 4)
+
+res_sample_size = readRDS('coef_n.rds')
+result = res_sample_size %>% group_by(n) %>% summarise(across(everything(), ~mean(.)))
+result = pivot_longer(result,cols=!n,names_to='method',values_to ='rho') %>% mutate(ours = ifelse(method %in% c('OASD','OASB'),TRUE,FALSE))
+p1 = ggplot(result %>% filter(!method %in% c('s','OASB','RBLW','OB')), aes(x=n,y=rho,group=method,color=method, linetype=ours))+geom_line(data = result %>% filter(!method %in% c('s','OASB','RBLW','OB','Oracle'))) + geom_line(data=result %>% filter(method=='Oracle'),color='black',show.legend=FALSE)+scale_linetype_manual(values = c("TRUE" = "solid", "FALSE" = "dashed"))+scale_color_manual(values = c("Oracle" = "black","OAS" = "blue","OD"="orange","OAS"="green","LW"="brown","SS"="purple","OASD"="red"),labels=c("LW"=TeX(r'($italic(LW)$)'), "OAS"=TeX(r'($italic(OAS)$)'), "OASD"=TeX(r'($italic(OASD)$)'), "OD"=TeX(r'($italic(OD)$)'), "SS"=TeX(r'($italic(SS)$)')))+ xlab(TeX(r'($italic(n)$)')) + ylab(TeX(r'($italic(Average)$ $\rho$)')) + guides(linetype = "none") + theme(
+  text = element_text(size = 12),              # Global text size
+  axis.title = element_text(size = 12),         # Axis titles
+  axis.text = element_text(size = 12),          # Axis text
+  plot.title = element_text(size = 12),         # Plot title
+  legend.title = element_text(size = 10, face="italic"),       # Legend title
+  legend.text = element_text(size = 10),
+  legend.position = "bottom", 
+  legend.box = "horizontal", 
+  legend.direction = "horizontal"
+)
+
+guide_plot <- get_legend(p1)
+p1 = p1 + theme(legend.position = 'none')
+
+res_sample_size = readRDS('n.rds')
+result = res_sample_size %>% group_by(n) %>% summarise(across(everything(), ~mean(.))) %>% ungroup() %>% mutate(across(-c(s,n), ~(.data$s-.)/.data$s)*100)
+result = pivot_longer(result,cols=!n,names_to='method',values_to ='PRIAL') %>% mutate(ours = ifelse(method %in% c('OASD','OASB'),TRUE,FALSE))
+p2 = ggplot(result %>% filter(!method %in% c('s','OASB','RBLW','OB')), aes(x=n,y=PRIAL,group=method,color=method, linetype=ours))+geom_line(data = result %>% filter(!method %in% c('s','OASB','RBLW','OB','Oracle'))) + geom_line(data=result %>% filter(method=='Oracle'),color='black',show.legend=FALSE)+scale_linetype_manual(values = c("TRUE" = "solid", "FALSE" = "dashed"))+scale_color_manual(values = c("Oracle" = "black","OAS" = "blue","OD"="orange","OAS"="green","LW"="brown","SS"="purple","OASD"="red"),labels=c("LW"=TeX(r'($LW$)'), "OAS"=TeX(r'($OAS$)'), "OASD"=TeX(r'($OASD$)'), "OD"=TeX(r'($OD$)'), "SS"=TeX(r'($SS$)'))) + xlab(TeX(r'($italic(n)$)')) + ylab(TeX(r'($italic(PRIAL)$)')) + guides(linetype = "none") + theme(
+  text = element_text(size = 12),              # Global text size
+  axis.title = element_text(size = 12),         # Axis titles
+  axis.text = element_text(size = 12),          # Axis text
+  plot.title = element_text(size = 12),         # Plot title
+  legend.title = element_text(size = 12),       # Legend title
+  legend.text = element_text(size = 12),         # Legend text
+  legend.position = "none"
+)
+
+combined_p = (p2 | p1)/guide_plot + 
+                 plot_layout(heights = c(1, 0.1))
+combined_p
+ggsave('n_mse+coef.jpg', width = 6, height = 4)
+
+res_sample_size = readRDS('coef_n*.rds')
+result = res_sample_size %>% group_by(n) %>% summarise(across(everything(), ~mean(.)))
+result = pivot_longer(result,cols=!n,names_to='method',values_to ='rho') %>% mutate(ours = ifelse(method %in% c('OASD','OASB'),TRUE,FALSE))
+p1 = ggplot(result %>% filter(!method %in% c('s','OASB','RBLW','OB')), aes(x=n,y=rho,group=method,color=method, linetype=ours))+geom_line(data = result %>% filter(!method %in% c('s','OASB','RBLW','OB','Oracle'))) + geom_line(data=result %>% filter(method=='Oracle'),color='black',show.legend=FALSE)+scale_linetype_manual(values = c("TRUE" = "solid", "FALSE" = "dashed"))+scale_color_manual(values = c("Oracle" = "black","OAS" = "blue","OD"="orange","OAS"="green","LW"="brown","SS"="purple","OASD"="red"),labels=c("LW"=TeX(r'($LW$)'), "OAS"=TeX(r'($OAS$)'), "OASD"=TeX(r'($OASD$)'), "OD"=TeX(r'($OD$)'), "SS"=TeX(r'($SS$)'))) + xlab(TeX(r'($n$)')) + ylab(TeX(r'(Shrinkage Parameter)'))+ guides(linetype = "none") + theme(
+  text = element_text(size = 12),              # Global text size
+  axis.title = element_text(size = 12),         # Axis titles
+  axis.text = element_text(size = 12),          # Axis text
+  plot.title = element_text(size = 12),         # Plot title
+  legend.title = element_text(size = 10),       # Legend title
+  legend.text = element_text(size = 10),
+  legend.position = "bottom", 
+  legend.box = "horizontal", 
+  legend.direction = "horizontal"
+)
+
+guide_plot <- get_legend(p1)
+p1 = p1 + theme(legend.position = 'none')
+
+res_sample_size = readRDS('n*.rds')
+result = res_sample_size %>% group_by(n) %>% summarise(across(everything(), ~mean(.))) %>% ungroup() %>% mutate(across(-c(s,n), ~(.data$s-.)/.data$s)*100)
+result = pivot_longer(result,cols=!n,names_to='method',values_to ='PRIAL') %>% mutate(ours = ifelse(method %in% c('OASD','OASB'),TRUE,FALSE))
+p2 = ggplot(result %>% filter(!method %in% c('s','OASB','RBLW','OB')), aes(x=n,y=PRIAL,group=method,color=method, linetype=ours))+geom_line(data = result %>% filter(!method %in% c('s','OASB','RBLW','OB','Oracle'))) + geom_line(data=result %>% filter(method=='Oracle'),color='black',show.legend=FALSE)+scale_linetype_manual(values = c("TRUE" = "solid", "FALSE" = "dashed"))+scale_color_manual(values = c("Oracle" = "black","OAS" = "blue","OD"="orange","OAS"="green","LW"="brown","SS"="purple","OASD"="red"),labels=c("LW"=TeX(r'($LW$)'), "OAS"=TeX(r'($OAS$)'), "OASD"=TeX(r'($OASD$)'), "OD"=TeX(r'($OD$)'), "SS"=TeX(r'($SS$)'))) + xlab(TeX(r'($n$)')) + guides(linetype = "none") + theme(
+  text = element_text(size = 12),              # Global text size
+  axis.title = element_text(size = 12),         # Axis titles
+  axis.text = element_text(size = 12),          # Axis text
+  plot.title = element_text(size = 12),         # Plot title
+  legend.title = element_text(size = 12),       # Legend title
+  legend.text = element_text(size = 12),         # Legend text
+  legend.position = "none"
+)
+
+combined_p = (p2 | p1)/guide_plot + 
+                 plot_layout(heights = c(1, 0.1))
+combined_p
+ggsave('n*_mse+coef.jpg', width = 6, height = 4)
+
+ggplotly(p2)
+```
+
+
+
+```{r check OD vs OASD}
+r = 0.5
+n = 18
+corr = matrix(0, ncol=p, nrow=p)
+for (i in 1:p){
+  for (j in 1:p){
+    corr[i,j]=r^abs(i-j)
+  }
+}
+
+
+sim <- function(large){
+  corr = matrix(0, ncol=p, nrow=p)
+  for (i in 1:p){
+    for (j in 1:p){
+      corr[i,j]=r^abs(i-j)
+    }
+  }
+  
+  sd = diag(c(rep(small,p/2),rep(large,p/2)))
+  cov = sd %*% corr %*% sd
+  sim_err <- function(iter){
+
+  param = data.frame(matrix(nrow=1,ncol=3))
+  colnames(param) = c('rho_oasd','rho_od','phi')
+  
+  # Generate samples from N(0,cov)
+  sample = mvrnorm(n, rep(0,p), cov)
+  
+  # Estimate the covariance matrix
+  scov = (t(sample) %*% sample)/nrow(sample)
+  f1 = (sum(diag(scov))/p)*diag(p)
+  f2 = diag(diag(scov))
+  tr_s = sum(diag(scov))
+  tr_s2 = sum(diag(t(scov) %*% scov))
+  tr_sdiag2 = sum(diag(diag(diag(scov)) %*% diag(diag(scov))))
+  
+  tr_t = sum(diag(cov))
+  tr_t2 = sum(diag(t(cov) %*% cov))
+  tr_tdiag2 = sum(diag(diag(diag(cov)) %*% diag(diag(cov))))
+  
+  scorr = cov2cor(scov)
+  tr_s_cor = sum(diag(scorr))
+  tr_s2_cor = sum(diag(t(scorr) %*% scorr))
+  f1_cor = (sum(diag(scorr))/p)*diag(p)
+  sample_sc = sample %*% (diag(diag(f2)^(-1/2)))
+
+  # Method 5: oas_v
+  phi1 = (tr_s2-tr_sdiag2)/(tr_s2+tr_s^2-2*tr_sdiag2)
+  rou_oas_variant = min(1/((n+1)*phi1),1)
+  
+  # Method 12: sample analogue
+  rou_od = ((1/n)*tr_s2-(2/n)*tr_sdiag2+(1/n)*tr_s^2)/(((n+1)/n)*tr_s2+(1/n)*tr_s^2-((n+2)/n)*tr_sdiag2)
+    
+    # Collect errors
+    param[1,'rho_oasd'] = rou_oas_variant
+    param[1,'rho_od'] = rou_od
+    param[1,'phi'] = phi1
+  
+  return(param)
+  }
+  res_sample_size = map_dfr(seq(1,1000),sim_err) %>% mutate(large=large)
+}
+res_sample_size = map_dfr(seq(large_min, large_max, 1),sim,.progress=TRUE)
+saveRDS(res_sample_size, 'check_phi.rds')
+# result = res_sample_size %>% group_by(n) %>% summarise(across(everything(), ~mean(.)))
+# result = pivot_longer(result,cols=!n,names_to='method',values_to ='rho') %>% mutate(ours = ifelse(method %in% c('OASD','OASB'),TRUE,FALSE))
+# pl = ggplot(result %>% filter(method != 's'), aes(x=n,y=rho,group=method,color=method, linetype=ours))+geom_line()+scale_linetype_manual(values = c("TRUE" = "solid", "FALSE" = "dashed")) + xlab(TeX(r'($n$)')) + ylab(TeX(r'($\rho$)'))+ guides(linetype = "none")
+# ggsave('coef_large.jpg')
+# ggplotly(pl)
+```
